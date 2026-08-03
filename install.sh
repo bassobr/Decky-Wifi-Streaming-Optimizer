@@ -1,10 +1,10 @@
 #!/bin/bash
 # WiFi Optimizer - Decky Plugin Installer
-# Usage: curl -sL https://github.com/ArcadaLabs-Jason/WifiOptimizer/raw/main/install.sh -o /tmp/wifi-opt-install.sh && sudo bash /tmp/wifi-opt-install.sh
+# Usage: curl -sL https://github.com/bassobr/Decky-Wifi-Streaming-Optimizer/raw/main/install.sh -o /tmp/wifi-opt-streaming-install.sh && sudo bash /tmp/wifi-opt-streaming-install.sh
 
 set -e
 
-PLUGIN_NAME="WiFi Optimizer"
+PLUGIN_NAME="WiFi Optimizer Streaming"
 
 # Check for root (needed to write to plugin dir and restart service)
 if [ "$(id -u)" -ne 0 ]; then
@@ -32,16 +32,16 @@ fi
 
 # Fetch latest release tag from GitHub
 echo "Checking for latest release..."
-LATEST_TAG=$(curl -sL "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+LATEST_TAG=$(curl -sL "https://api.github.com/repos/bassobr/Decky-Wifi-Streaming-Optimizer/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
 
 if [ -z "$LATEST_TAG" ]; then
     echo "Warning: Couldn't fetch latest release, falling back to main branch"
-    REPO_URL="https://github.com/ArcadaLabs-Jason/WifiOptimizer/archive/refs/heads/main.tar.gz"
-    DIR_NAME="WifiOptimizer-main"
+    REPO_URL="https://github.com/bassobr/Decky-Wifi-Streaming-Optimizer/archive/refs/heads/main.tar.gz"
+    DIR_NAME="Decky-Wifi-Streaming-Optimizer-main"
 else
     echo "Latest release: $LATEST_TAG"
-    REPO_URL="https://github.com/ArcadaLabs-Jason/WifiOptimizer/archive/refs/tags/${LATEST_TAG}.tar.gz"
-    DIR_NAME="WifiOptimizer-${LATEST_TAG#v}"
+    REPO_URL="https://github.com/bassobr/Decky-Wifi-Streaming-Optimizer/archive/refs/tags/${LATEST_TAG}.tar.gz"
+    DIR_NAME="Decky-Wifi-Streaming-Optimizer-${LATEST_TAG#v}"
 fi
 
 TMP_DIR=$(mktemp -d)

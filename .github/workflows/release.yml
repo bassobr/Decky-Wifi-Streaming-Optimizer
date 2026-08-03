@@ -1,0 +1,67 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Syntax-check backend
+        run: |
+          python3 -m py_compile main.py
+          bash -n defaults/dispatcher.sh.tmpl
+          bash -n install.sh
+
+      - name: Package plugin zip
+        run: |
+          PLUGIN="WiFi Optimizer Streaming"
+          mkdir -p "pack/$PLUGIN/dist" "pack/$PLUGIN/defaults" "pack/$PLUGIN/py_modules"
+          cp plugin.json package.json main.py decky.pyi LICENSE README.md "pack/$PLUGIN/"
+          cp dist/index.js "pack/$PLUGIN/dist/"
+          cp dist/index.js.map "pack/$PLUGIN/dist/" 2>/dev/null || true
+          cp defaults/dispatcher.sh.tmpl "pack/$PLUGIN/defaults/"
+          touch "pack/$PLUGIN/py_modules/.keep"
+          VERSION=$(python3 -c "import json;print(json.load(open('package.json'))['version'])")
+          cd pack && zip -r "../wifi-optimizer-streaming-$VERSION.zip" "$PLUGIN"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-zip
+          path: wifi-optimizer-streaming-*.zip
+
+      # The in-app updater installs from the tag's source tarball, which is
+      # why dist/index.js is committed to the repo. The zip attached here is
+      # for manual installs.
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" wifi-optimizer-streaming-*.zip \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

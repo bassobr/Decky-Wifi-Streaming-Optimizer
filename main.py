@@ -1949,10 +1949,10 @@ class Plugin:
             decky.logger.error(f"set_update_channel error: {e}")
             return self._unexpected_response(e)
 
-    # Fork note: self-update is disabled. The upstream updater would fetch
-    # ArcadaLabs-Jason/WifiOptimizer and overwrite the streaming-mode changes.
-    # Point UPDATE_REPO at your own GitHub fork ("user/repo") to re-enable.
-    UPDATE_REPO = ""
+    # Fork note: self-update pulls from this repo, not upstream
+    # (ArcadaLabs-Jason/WifiOptimizer), so upstream releases can't overwrite
+    # the streaming-mode changes. Empty string disables self-update entirely.
+    UPDATE_REPO = "bassobr/Decky-Wifi-Streaming-Optimizer"
 
     async def check_for_update(self) -> dict:
         """Check GitHub for a newer version (stable release or beta branch)."""
@@ -1976,7 +1976,7 @@ class Plugin:
                     [
                         "/usr/bin/curl", "-sL", "--connect-timeout", "3", "--max-time", "10",
                         "-H", "Accept: application/vnd.github.raw+json",
-                        "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/contents/package.json?ref=beta",
+                        f"https://api.github.com/repos/{self.UPDATE_REPO}/contents/package.json?ref=beta",
                     ],
                     15,
                     True,
@@ -1987,7 +1987,7 @@ class Plugin:
                     [
                         "/usr/bin/curl", "-sL", "--connect-timeout", "3", "--max-time", "10",
                         "-H", "Accept: application/vnd.github.v3+json",
-                        "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest",
+                        f"https://api.github.com/repos/{self.UPDATE_REPO}/releases/latest",
                     ],
                     15,
                     True,
@@ -2065,15 +2065,16 @@ class Plugin:
             channel = info.get("channel", "stable")
             latest = info["latest_version"]
             plugin_dir = decky.DECKY_PLUGIN_DIR
+            repo_name = self.UPDATE_REPO.split("/")[1]
 
             if channel == "beta":
-                download_url = "https://github.com/ArcadaLabs-Jason/WifiOptimizer/archive/refs/heads/beta.tar.gz"
-                src_dir = "WifiOptimizer-beta"
+                download_url = f"https://github.com/{self.UPDATE_REPO}/archive/refs/heads/beta.tar.gz"
+                src_dir = f"{repo_name}-beta"
                 label = f"beta v{latest}"
             else:
                 tag = f"v{latest}"
-                download_url = f"https://github.com/ArcadaLabs-Jason/WifiOptimizer/archive/refs/tags/{tag}.tar.gz"
-                src_dir = f"WifiOptimizer-{latest}"
+                download_url = f"https://github.com/{self.UPDATE_REPO}/archive/refs/tags/{tag}.tar.gz"
+                src_dir = f"{repo_name}-{latest}"
                 label = f"v{latest}"
 
             script = f"""#!/bin/bash

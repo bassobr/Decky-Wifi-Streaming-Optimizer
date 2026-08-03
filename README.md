@@ -6,9 +6,19 @@ This is a fork of [ArcadaLabs-Jason/WifiOptimizer](https://github.com/ArcadaLabs
 - **App detection via process watcher:** GeForce NOW, Moonlight, Chiaki, Steam Link, Greenlight, Parsec and Xbox Cloud Gaming are detected out of the box - each individually toggleable - plus a free-form field for custom process patterns.
 - **Everything stays toggleable:** with auto mode off, the plugin behaves exactly like upstream (fixes apply globally).
 - The NetworkManager dispatcher respects the auto mode too, so a reconnect or sleep/wake won't apply fixes while no stream is running.
-- In-app self-update is disabled in this fork so upstream releases can't overwrite it.
+- In-app self-update pulls from this repo ([bassobr/Decky-Wifi-Streaming-Optimizer](https://github.com/bassobr/Decky-Wifi-Streaming-Optimizer)), so upstream releases can't overwrite the fork.
 
-Original README below.
+## Install (fork)
+
+[Decky Loader](https://decky.xyz/) must be installed first. Then open Desktop Mode > Konsole and run:
+
+```bash
+curl -sL https://github.com/bassobr/Decky-Wifi-Streaming-Optimizer/raw/main/install.sh -o /tmp/wifi-opt-streaming-install.sh && sudo bash /tmp/wifi-opt-streaming-install.sh
+```
+
+> **Note:** This fork installs as a separate plugin ("WiFi Optimizer Streaming"). If the original WiFi Optimizer is installed, uninstall it first - both manage the same system files (NetworkManager dispatcher, modprobe/NM config) and would fight over them.
+
+Original README below (upstream install instructions do not apply to this fork).
 
 ---
 
