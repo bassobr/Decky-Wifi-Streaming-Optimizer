@@ -1,6 +1,6 @@
 {
   "name": "wifi-optimizer-streaming",
-  "version": "0.12.1",
+  "version": "0.12.2",
   "description": "WiFi optimizer for game streaming on Steam Deck and PC handhelds - fork with streaming-app auto mode",
   "type": "module",
   "scripts": {

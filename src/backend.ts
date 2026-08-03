@@ -22,6 +22,7 @@ export const setStreamingMode = callable<[enabled: boolean], MethodResult>("set_
 export const setStreamingApp = callable<[appId: string, enabled: boolean], MethodResult>("set_streaming_app");
 export const setStreamingCustomPatterns = callable<[patterns: string], MethodResult>("set_streaming_custom_patterns");
 export const getStreamingApps = callable<[], StreamingAppsResult>("get_streaming_apps");
+export const pokeDetection = callable<[], MethodResult>("poke_detection");
 export const optimizeSafe = callable<[], OptimizeSafeResult>("optimize_safe");
 export const reapplyAll = callable<[], OptimizeSafeResult>("reapply_all");
 export const reapplyVolatile = callable<[], MethodResult>("reapply_volatile");

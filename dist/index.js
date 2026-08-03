@@ -97,6 +97,7 @@ const setStreamingMode = callable("set_streaming_mode");
 const setStreamingApp = callable("set_streaming_app");
 const setStreamingCustomPatterns = callable("set_streaming_custom_patterns");
 const getStreamingApps = callable("get_streaming_apps");
+const pokeDetection = callable("poke_detection");
 const optimizeSafe = callable("optimize_safe");
 const reapplyAll = callable("reapply_all");
 const reapplyVolatile = callable("reapply_volatile");
@@ -1004,14 +1005,33 @@ function Content() {
 }
 var index = definePlugin(() => {
     let gameLifetimeUnsub = null;
+    // Fast path only: this hooks an UNDOCUMENTED Steam client API that Valve
+    // may change at any time. Every failure mode is swallowed on purpose - if
+    // the hook dies, streaming detection just falls back to the backend's 5s
+    // process watcher and nothing is lost except a few seconds of latency.
     try {
-        gameLifetimeUnsub = SteamClient.GameSessions.RegisterForAppLifetimeNotifications((notification) => {
-            if (notification.bRunning) {
-                setTimeout(() => {
-                    reapplyVolatile().catch(() => { });
-                }, 3000);
-            }
-        });
+        const register = typeof SteamClient !== "undefined"
+            ? SteamClient?.GameSessions?.RegisterForAppLifetimeNotifications
+            : undefined;
+        if (typeof register === "function") {
+            gameLifetimeUnsub = register((notification) => {
+                // Immediate pass: catches app exit right away and app launch when
+                // the process is already up. pokeDetection is a no-op with
+                // streaming auto mode off.
+                pokeDetection().catch(() => { });
+                if (notification.bRunning) {
+                    // Second pass after launch wrappers (reaper/bash/flatpak) have
+                    // spawned the real client, plus the global-mode volatile reapply.
+                    setTimeout(() => {
+                        pokeDetection().catch(() => { });
+                        reapplyVolatile().catch(() => { });
+                    }, 3000);
+                }
+            });
+        }
+        else {
+            console.warn("WiFi Optimizer: AppLifetimeNotifications API unavailable, relying on backend watcher");
+        }
     }
     catch (e) {
         console.error("WiFi Optimizer: failed to register game launch listener", e);

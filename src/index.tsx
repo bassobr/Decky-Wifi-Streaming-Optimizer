@@ -869,16 +869,37 @@ function Content() {
 export default definePlugin(() => {
   let gameLifetimeUnsub: { unregister(): void } | null = null;
 
+  // Fast path only: this hooks an UNDOCUMENTED Steam client API that Valve
+  // may change at any time. Every failure mode is swallowed on purpose - if
+  // the hook dies, streaming detection just falls back to the backend's 5s
+  // process watcher and nothing is lost except a few seconds of latency.
   try {
-    gameLifetimeUnsub = SteamClient.GameSessions.RegisterForAppLifetimeNotifications(
-      (notification: { bRunning: boolean }) => {
-        if (notification.bRunning) {
-          setTimeout(() => {
-            backend.reapplyVolatile().catch(() => {});
-          }, 3000);
-        }
-      },
-    );
+    const register =
+      typeof SteamClient !== "undefined"
+        ? SteamClient?.GameSessions?.RegisterForAppLifetimeNotifications
+        : undefined;
+    if (typeof register === "function") {
+      gameLifetimeUnsub = register(
+        (notification: { bRunning: boolean }) => {
+          // Immediate pass: catches app exit right away and app launch when
+          // the process is already up. pokeDetection is a no-op with
+          // streaming auto mode off.
+          backend.pokeDetection().catch(() => {});
+          if (notification.bRunning) {
+            // Second pass after launch wrappers (reaper/bash/flatpak) have
+            // spawned the real client, plus the global-mode volatile reapply.
+            setTimeout(() => {
+              backend.pokeDetection().catch(() => {});
+              backend.reapplyVolatile().catch(() => {});
+            }, 3000);
+          }
+        },
+      );
+    } else {
+      console.warn(
+        "WiFi Optimizer: AppLifetimeNotifications API unavailable, relying on backend watcher"
+      );
+    }
   } catch (e) {
     console.error("WiFi Optimizer: failed to register game launch listener", e);
   }

@@ -9,6 +9,7 @@ QoS) on every WiFi reconnect independently of Decky.
 """
 
 import os
+import copy
 import json
 import time
 import asyncio
@@ -198,8 +199,20 @@ DEFAULT_SETTINGS = {
 }
 
 
+# In-memory settings cache keyed on the file's (mtime_ns, size). Only this
+# process writes settings.json, so the stat check exists purely to catch
+# external edits/deletion; the steady-state win is that the 5s watcher poll
+# and the 3s UI status poll stop hitting the disk. Callers get a deep copy -
+# they mutate the result before saving, which must never leak into the cache.
+_settings_cache: dict = {"stat": None, "data": None}
+
+
 def _load_settings() -> dict:
     try:
+        st = os.stat(SETTINGS_FILE)
+        cache_key = (st.st_mtime_ns, st.st_size)
+        if _settings_cache["stat"] == cache_key and _settings_cache["data"] is not None:
+            return copy.deepcopy(_settings_cache["data"])
         with open(SETTINGS_FILE, "r") as f:
             data = json.load(f)
         # Merge with defaults (adds new keys), then strip stale keys
@@ -210,9 +223,12 @@ def _load_settings() -> dict:
         merged["streaming_apps"] = {
             app_id: bool(saved_apps.get(app_id, True)) for app_id in STREAMING_APPS
         }
-        return {k: v for k, v in merged.items() if k in DEFAULT_SETTINGS}
+        result = {k: v for k, v in merged.items() if k in DEFAULT_SETTINGS}
+        _settings_cache["stat"] = cache_key
+        _settings_cache["data"] = copy.deepcopy(result)
+        return result
     except Exception:
-        return dict(DEFAULT_SETTINGS)
+        return copy.deepcopy(DEFAULT_SETTINGS)
 
 
 def _save_settings(data: dict):
@@ -222,6 +238,13 @@ def _save_settings(data: dict):
     with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp_path, SETTINGS_FILE)
+    try:
+        st = os.stat(SETTINGS_FILE)
+        _settings_cache["stat"] = (st.st_mtime_ns, st.st_size)
+        _settings_cache["data"] = copy.deepcopy(data)
+    except Exception:
+        _settings_cache["stat"] = None
+        _settings_cache["data"] = None
 
 
 def _save_settings_with_timestamp(data: dict):
@@ -620,49 +643,92 @@ class Plugin:
                     return label
         return None
 
+    def _ensure_streaming_state(self):
+        """Lazy init so IPC-driven passes work even if _main hasn't run yet."""
+        if not hasattr(self, "_detect_lock"):
+            self._detect_lock = asyncio.Lock()
+            self._streaming_misses = 0
+
+    async def _run_detection_pass(self, settle_immediately: bool = False):
+        """One detection pass. The watcher loop calls this with hysteresis
+        (STREAMING_MISS_THRESHOLD empty scans before reverting); event-driven
+        callers (game launch/exit notification, app-list edits) pass
+        settle_immediately=True since their trigger already signals a state
+        change. The lock serializes concurrent passes."""
+        self._ensure_streaming_state()
+        async with self._detect_lock:
+            settings = _load_settings()
+            if not settings.get("streaming_mode_enabled"):
+                return
+            detected = await asyncio.to_thread(self._detect_streaming_app, settings)
+            # Reload after the await: a setter may have written settings while
+            # the scan ran in the thread; mutating that stale copy would
+            # silently undo the user's change. Only the two runtime fields
+            # below are touched on the fresh copy.
+            settings = _load_settings()
+            if not settings.get("streaming_mode_enabled"):
+                return
+            was_active = settings.get("streaming_active", False)
+            if detected:
+                self._streaming_misses = 0
+                if not was_active:
+                    settings["streaming_active"] = True
+                    settings["streaming_detected_app"] = detected
+                    _save_settings(settings)
+                    decky.logger.info(
+                        f"Streaming app detected: {detected} - applying fixes"
+                    )
+                    await self._apply_streaming_profile(True)
+                elif detected != settings.get("streaming_detected_app"):
+                    settings["streaming_detected_app"] = detected
+                    _save_settings(settings)
+            elif was_active:
+                self._streaming_misses += 1
+                if settle_immediately or self._streaming_misses >= STREAMING_MISS_THRESHOLD:
+                    self._streaming_misses = 0
+                    settings["streaming_active"] = False
+                    settings["streaming_detected_app"] = ""
+                    _save_settings(settings)
+                    decky.logger.info(
+                        "Streaming app exited - reverting to standard settings"
+                    )
+                    await self._apply_streaming_profile(False)
+            else:
+                self._streaming_misses = 0
+
     async def _streaming_watcher(self):
         """Background task: polls /proc and flips the volatile fixes when a
         monitored streaming app starts or exits."""
-        misses = 0
+        last_error_logged = 0.0
         while True:
             try:
-                settings = _load_settings()
-                if settings.get("streaming_mode_enabled"):
-                    detected = await asyncio.to_thread(
-                        self._detect_streaming_app, settings
-                    )
-                    was_active = settings.get("streaming_active", False)
-                    if detected:
-                        misses = 0
-                        if not was_active:
-                            settings["streaming_active"] = True
-                            settings["streaming_detected_app"] = detected
-                            _save_settings(settings)
-                            decky.logger.info(
-                                f"Streaming app detected: {detected} - applying fixes"
-                            )
-                            await self._apply_streaming_profile(True)
-                        elif detected != settings.get("streaming_detected_app"):
-                            settings["streaming_detected_app"] = detected
-                            _save_settings(settings)
-                    elif was_active:
-                        misses += 1
-                        if misses >= STREAMING_MISS_THRESHOLD:
-                            misses = 0
-                            settings["streaming_active"] = False
-                            settings["streaming_detected_app"] = ""
-                            _save_settings(settings)
-                            decky.logger.info(
-                                "Streaming app exited - reverting to standard settings"
-                            )
-                            await self._apply_streaming_profile(False)
-                    else:
-                        misses = 0
+                await self._run_detection_pass()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                decky.logger.error(f"streaming watcher error: {e}")
+                # Rate-limit: a persistent failure (e.g. corrupt settings)
+                # would otherwise log the same error every poll.
+                now = time.monotonic()
+                if now - last_error_logged > 300:
+                    last_error_logged = now
+                    decky.logger.error(f"streaming watcher error: {e}")
             await asyncio.sleep(STREAMING_POLL_INTERVAL)
+
+    async def poke_detection(self) -> dict:
+        """Run one immediate detection pass. Called by the frontend on game
+        launch/exit notifications so fixes apply/revert without waiting for
+        the next watcher poll. Harmless no-op when auto mode is off."""
+        try:
+            await self._run_detection_pass(settle_immediately=True)
+            settings = _load_settings()
+            return {
+                "success": True,
+                "streaming_active": settings.get("streaming_active", False),
+                "streaming_detected_app": settings.get("streaming_detected_app", ""),
+            }
+        except Exception as e:
+            decky.logger.error(f"poke_detection error: {e}")
+            return self._unexpected_response(e)
 
     def _install_dispatcher(self):
         try:
@@ -752,6 +818,7 @@ class Plugin:
             if settings.get("auto_fix_on_wake", True):
                 self._install_dispatcher()
 
+            self._ensure_streaming_state()
             self._streaming_watcher_task = asyncio.create_task(
                 self._streaming_watcher()
             )
@@ -1613,6 +1680,8 @@ class Plugin:
         without waiting for the watcher; when turning it off, fall back to the
         global toggles (apply immediately if any are enabled)."""
         try:
+            self._ensure_streaming_state()
+            self._streaming_misses = 0
             settings = _load_settings()
             settings["streaming_mode_enabled"] = enabled
 
@@ -1671,6 +1740,9 @@ class Plugin:
             apps[app_id] = enabled
             settings["streaming_apps"] = apps
             _save_settings(settings)
+            # Re-detect immediately so e.g. disabling the currently-detected
+            # app takes effect now instead of on the next watcher poll.
+            await self._run_detection_pass(settle_immediately=True)
             return {"success": True, "app_id": app_id, "enabled": enabled}
         except Exception as e:
             decky.logger.error(f"set_streaming_app error: {e}")
@@ -1682,6 +1754,7 @@ class Plugin:
             settings = _load_settings()
             settings["streaming_custom_patterns"] = (patterns or "").strip()
             _save_settings(settings)
+            await self._run_detection_pass(settle_immediately=True)
             return {"success": True, "patterns": settings["streaming_custom_patterns"]}
         except Exception as e:
             decky.logger.error(f"set_streaming_custom_patterns error: {e}")
