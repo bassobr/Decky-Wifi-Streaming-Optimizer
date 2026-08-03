@@ -1,11 +1,11 @@
 {
-  "name": "WiFi Optimizer",
-  "author": "Arcada Labs",
+  "name": "WiFi Optimizer Streaming",
+  "author": "Arcada Labs (fork: streaming auto mode)",
   "flags": ["root"],
   "api_version": 1,
   "publish": {
-    "tags": ["wifi", "network", "optimization", "streaming", "moonlight", "handheld"],
-    "description": "WiFi optimizations for game streaming. Survives sleep and updates.",
+    "tags": ["wifi", "network", "optimization", "streaming", "moonlight", "geforce now", "handheld"],
+    "description": "WiFi optimizations for game streaming, applied automatically only while a streaming app runs.",
     "image": ""
   }
 }

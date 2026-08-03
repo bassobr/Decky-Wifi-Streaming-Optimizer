@@ -18,6 +18,11 @@ export interface PluginSettings {
   ipv6_disabled: boolean;
   buffer_tuning_enabled: boolean;
   cake_enabled: boolean;
+  streaming_mode_enabled: boolean;
+  streaming_apps: Record<string, boolean>;
+  streaming_custom_patterns: string;
+  streaming_active: boolean;
+  streaming_detected_app: string;
   distro_id: string;
   distro_name: string;
   last_connection_uuid: string;
@@ -44,6 +49,18 @@ export interface LiveStatus {
   last_enforced?: number;
   wifi_backend?: string;
   backend_tool_available?: boolean;
+  streaming_active?: boolean;
+  streaming_detected_app?: string;
+}
+
+export interface StreamingApp {
+  id: string;
+  label: string;
+}
+
+export interface StreamingAppsResult {
+  success: boolean;
+  apps: StreamingApp[];
 }
 
 export interface PluginStatus {

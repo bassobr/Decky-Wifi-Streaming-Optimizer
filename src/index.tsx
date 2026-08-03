@@ -36,6 +36,7 @@ import { UpdatesSection } from "./components/UpdatesSection";
 import { PanelHeader } from "./components/PanelHeader";
 import { PanelFooter } from "./components/PanelFooter";
 import { ActionsSection } from "./components/ActionsSection";
+import { StreamingSection } from "./components/StreamingSection";
 import { theme } from "./theme";
 
 const REFRESH_INTERVAL = 3000;
@@ -396,6 +397,17 @@ function Content() {
   const handleForceReapply = () =>
     handleToggle("reapply", () => backend.reapplyAll());
 
+  const handleStreamingMode = (val: boolean) =>
+    handleToggle("streaming_mode", () => backend.setStreamingMode(val));
+
+  const handleStreamingApp = (appId: string, val: boolean) =>
+    handleToggle("streaming_mode", () => backend.setStreamingApp(appId, val));
+
+  const handleStreamingPatterns = (patterns: string) =>
+    handleToggle("streaming_mode", () =>
+      backend.setStreamingCustomPatterns(patterns)
+    );
+
   const handleResetSettings = async () => {
     if (busyRef.current) return;
     setBusy(true);
@@ -498,16 +510,20 @@ function Content() {
   const driftCount = status?.drift ? Object.keys(status.drift).length : 0;
   const supports6GHz = s?.supports_6ghz ?? false;
   const isDeckLcd = s?.device_family === "deck_lcd";
+  const streamingMode = s?.streaming_mode_enabled ?? false;
 
-  // Check if all safe optimizations are already active
+  // Check if all safe optimizations are already active. With streaming auto
+  // mode on and no stream running, the volatile fixes are intentionally not
+  // applied - judge them by intent (settings) instead of live state.
+  const gateOpen = !streamingMode || (status?.live?.streaming_active ?? false);
   const allSafeActive =
     connected &&
-    status?.live?.power_save_off &&
+    (gateOpen ? status?.live?.power_save_off : s?.power_save_disabled) &&
     !status?.drift?.power_save &&
     s?.bssid_lock_enabled &&
     !status?.drift?.bssid_lock &&
     status?.live?.dispatcher_installed &&
-    status?.live?.buffer_tuning_applied &&
+    (gateOpen ? status?.live?.buffer_tuning_applied : s?.buffer_tuning_enabled) &&
     !status?.drift?.buffer_tuning;
 
   return (
@@ -634,11 +650,25 @@ function Content() {
         </PanelSectionRow>
       </PanelSection>
 
+      {/* Streaming auto mode */}
+      <StreamingSection
+        status={status}
+        isBusy={isBusy}
+        error={errors.streaming_mode}
+        onToggleMode={handleStreamingMode}
+        onToggleApp={handleStreamingApp}
+        onSavePatterns={handleStreamingPatterns}
+      />
+
       {/* Power & stability */}
       <PanelSection title="Power & stability">
         <InfoRow
           label="Prevent lag spikes"
-          subtitle="Disables WiFi power save and PCIe power states"
+          subtitle={
+            streamingMode
+              ? "Auto: applied only while a streaming app runs"
+              : "Disables WiFi power save and PCIe power states"
+          }
           explanation="The OS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal."
           {...getBadge("power_save", status, errors.power_save ?? null)}
           checked={s?.power_save_disabled ?? false}
@@ -674,7 +704,11 @@ function Content() {
         />
         <InfoRow
           label="Network buffer tuning"
-          subtitle="Optimize UDP buffers and TX queue for streaming"
+          subtitle={
+            streamingMode
+              ? "Auto: applied only while a streaming app runs"
+              : "Optimize UDP buffers and TX queue for streaming"
+          }
           explanation="Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot."
           {...getBadge("buffer_tuning", status, errors.buffer_tuning ?? null)}
           checked={s?.buffer_tuning_enabled ?? false}
@@ -770,7 +804,11 @@ function Content() {
         />
         <InfoRow
           label="Traffic shaping (CAKE)"
-          subtitle="Fair queuing and bufferbloat prevention"
+          subtitle={
+            streamingMode
+              ? "Auto: applied only while a streaming app runs"
+              : "Fair queuing and bufferbloat prevention"
+          }
           explanation="Replaces the default network queue with CAKE, which isolates traffic flows so a background download or another device can't starve your game stream. Also filters redundant TCP acknowledgments and prioritizes latency-sensitive packets. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled."
           {...getBadge("cake", status, errors.cake ?? null)}
           checked={s?.cake_enabled ?? false}

@@ -111,6 +111,26 @@ DNS_PROVIDERS = {
     "quad9": "9.9.9.9 149.112.112.112",
 }
 
+# Known streaming clients, matched as lowercase substrings against
+# /proc/<pid>/cmdline. Patterns are chosen to hit the flatpak/app binary or a
+# characteristic launch argument (GeForce NOW runs as a Chromium app pointed
+# at play.geforcenow.com), so detection works no matter whether the app was
+# launched as a Steam shortcut, from desktop mode, or via a browser kiosk.
+STREAMING_APPS = {
+    "moonlight": {"label": "Moonlight", "patterns": ["moonlight"]},
+    "geforce_now": {"label": "GeForce NOW", "patterns": ["geforcenow", "play.geforcenow.com"]},
+    "chiaki": {"label": "Chiaki (PS Remote Play)", "patterns": ["chiaki"]},
+    "steam_link": {"label": "Steam Link", "patterns": ["steamlink"]},
+    "greenlight": {"label": "Greenlight (Xbox)", "patterns": ["greenlight"]},
+    "parsec": {"label": "Parsec", "patterns": ["parsecd"]},
+    "xbox_cloud": {"label": "Xbox Cloud Gaming", "patterns": ["xbox.com/play"]},
+}
+
+STREAMING_POLL_INTERVAL = 5
+# Consecutive empty scans before reverting to standard settings; bridges app
+# restarts and brief process churn without flapping the WiFi config.
+STREAMING_MISS_THRESHOLD = 2
+
 # Tuned values for game streaming: larger socket buffers absorb bursty UDP
 # traffic, higher netdev backlog/budget lets the kernel process more packets
 # per NAPI cycle, and disabling tcp_slow_start_after_idle keeps TCP congestion
@@ -160,6 +180,11 @@ DEFAULT_SETTINGS = {
     "ipv6_disabled": False,
     "buffer_tuning_enabled": False,
     "cake_enabled": False,
+    "streaming_mode_enabled": False,
+    "streaming_apps": {app_id: True for app_id in STREAMING_APPS},
+    "streaming_custom_patterns": "",
+    "streaming_active": False,
+    "streaming_detected_app": "",
     "last_connection_uuid": "",
     "priority_set": False,
     "distro_id": "unknown",
@@ -175,6 +200,12 @@ def _load_settings() -> dict:
             data = json.load(f)
         # Merge with defaults (adds new keys), then strip stale keys
         merged = {**DEFAULT_SETTINGS, **data}
+        # streaming_apps merges per-app so newly added presets default to
+        # enabled without clobbering the user's existing choices.
+        saved_apps = data.get("streaming_apps") or {}
+        merged["streaming_apps"] = {
+            app_id: bool(saved_apps.get(app_id, True)) for app_id in STREAMING_APPS
+        }
         return {k: v for k, v in merged.items() if k in DEFAULT_SETTINGS}
     except Exception:
         return dict(DEFAULT_SETTINGS)
@@ -454,6 +485,181 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"PCIe ASPM fix error: {e}")
 
+    # ---- Streaming auto mode ----
+    #
+    # When streaming_mode_enabled is on, the volatile fixes (power save/ASPM,
+    # buffer tuning, CAKE) are only held active while a detected streaming app
+    # is running; outside of that the system stays on stock settings. The
+    # "gate" below is the single source of truth for whether those fixes may
+    # currently be applied. Reconnect-triggering settings (BSSID lock, band,
+    # DNS, IPv6) are deliberately NOT gated - toggling them mid-session would
+    # drop the connection the stream is running on.
+
+    def _volatile_gate_open(self, settings: dict | None = None) -> bool:
+        s = settings if settings is not None else _load_settings()
+        return (not s.get("streaming_mode_enabled", False)) or s.get(
+            "streaming_active", False
+        )
+
+    def _apply_power_save_now(self, off: bool) -> dict:
+        """Apply (off=True) or revert (off=False) the runtime power save state:
+        iw power_save, driver-specific fixes, PCIe ASPM. Does not persist."""
+        iface = self._get_wifi_interface()
+        if iface:
+            state = "off" if off else "on"
+            result = self._run_cmd(
+                ["/usr/bin/iw", "dev", iface, "set", "power_save", state]
+            )
+            if not result["success"]:
+                return {
+                    "success": False,
+                    "error": "iw_failed",
+                    "message": "Couldn't change WiFi power save",
+                    "detail": result["stderr"],
+                }
+        self._apply_driver_fixes(off)
+        self._apply_pcie_aspm_fix(off)
+        return {"success": True}
+
+    def _apply_buffer_tuning_now(self, on: bool, settings: dict | None = None):
+        """Apply tuned or default sysctl values and txqueuelen. Does not persist."""
+        s = settings if settings is not None else _load_settings()
+        params = SYSCTL_PARAMS if on else SYSCTL_DEFAULTS
+        for key, value in params.items():
+            result = self._run_cmd(["/usr/bin/sysctl", "-w", f"{key}={value}"])
+            if not result["success"]:
+                decky.logger.error(f"sysctl {key}={value} failed: {result['stderr']}")
+        iface = self._get_wifi_interface()
+        if iface:
+            # CAKE manages its own queue; keep txqueuelen at 256 while it is
+            # active so the two features don't fight over the value.
+            cake_active = s.get("cake_enabled") and self._volatile_gate_open(s)
+            if cake_active:
+                txq = "256"
+            else:
+                txq = "2000" if on else "1000"
+            self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", txq])
+
+    def _apply_cake_now(self, on: bool, settings: dict | None = None) -> dict:
+        """Install or remove the CAKE qdisc. Does not persist."""
+        s = settings if settings is not None else _load_settings()
+        iface = self._get_wifi_interface()
+        if not iface:
+            return {"success": False, "error": "no_wifi", "message": "Not connected to WiFi."}
+        if on:
+            modprobe = "/usr/bin/modprobe" if os.path.isfile("/usr/bin/modprobe") else "/usr/sbin/modprobe"
+            self._run_cmd([modprobe, "sch_cake"], timeout=5)
+            result = self._run_cmd([
+                "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
+                "cake", "unlimited", "diffserv4", "nat", "ack-filter",
+            ])
+            if not result["success"]:
+                return {
+                    "success": False,
+                    "error": "unexpected",
+                    "message": "Failed to apply CAKE qdisc.",
+                    "detail": result.get("stderr", ""),
+                }
+            self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"])
+        else:
+            self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
+            buffer_active = s.get("buffer_tuning_enabled") and self._volatile_gate_open(s)
+            txq = "2000" if buffer_active else "1000"
+            self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", txq])
+        return {"success": True}
+
+    async def _apply_streaming_profile(self, active: bool):
+        """Apply (stream started) or revert (stream ended) every volatile fix
+        the user has enabled. Called by the watcher on state transitions and
+        by set_streaming_mode when the mode itself is toggled."""
+        settings = _load_settings()
+        if settings.get("buffer_tuning_enabled"):
+            self._apply_buffer_tuning_now(active, settings)
+        if settings.get("cake_enabled"):
+            self._apply_cake_now(active, settings)
+        if settings.get("power_save_disabled"):
+            self._apply_power_save_now(active)
+
+    def _detect_streaming_app(self, settings: dict) -> str | None:
+        """Scan /proc for a running streaming client. Returns the app label of
+        the first match or None. Matches lowercase substrings against each
+        process's full command line."""
+        patterns: list[tuple[str, str]] = []
+        apps_enabled = settings.get("streaming_apps", {})
+        for app_id, info in STREAMING_APPS.items():
+            if apps_enabled.get(app_id, True):
+                for p in info["patterns"]:
+                    patterns.append((p, info["label"]))
+        custom = settings.get("streaming_custom_patterns", "") or ""
+        for p in custom.replace(",", " ").split():
+            patterns.append((p.lower(), p))
+        if not patterns:
+            return None
+
+        own_pid = str(os.getpid())
+        try:
+            pids = os.listdir("/proc")
+        except Exception:
+            return None
+        for pid in pids:
+            if not pid.isdigit() or pid == own_pid:
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\0", b" ").decode("utf-8", "ignore").lower()
+            except Exception:
+                continue
+            if not cmd:
+                continue
+            for pattern, label in patterns:
+                if pattern in cmd:
+                    return label
+        return None
+
+    async def _streaming_watcher(self):
+        """Background task: polls /proc and flips the volatile fixes when a
+        monitored streaming app starts or exits."""
+        misses = 0
+        while True:
+            try:
+                settings = _load_settings()
+                if settings.get("streaming_mode_enabled"):
+                    detected = await asyncio.to_thread(
+                        self._detect_streaming_app, settings
+                    )
+                    was_active = settings.get("streaming_active", False)
+                    if detected:
+                        misses = 0
+                        if not was_active:
+                            settings["streaming_active"] = True
+                            settings["streaming_detected_app"] = detected
+                            _save_settings(settings)
+                            decky.logger.info(
+                                f"Streaming app detected: {detected} - applying fixes"
+                            )
+                            await self._apply_streaming_profile(True)
+                        elif detected != settings.get("streaming_detected_app"):
+                            settings["streaming_detected_app"] = detected
+                            _save_settings(settings)
+                    elif was_active:
+                        misses += 1
+                        if misses >= STREAMING_MISS_THRESHOLD:
+                            misses = 0
+                            settings["streaming_active"] = False
+                            settings["streaming_detected_app"] = ""
+                            _save_settings(settings)
+                            decky.logger.info(
+                                "Streaming app exited - reverting to standard settings"
+                            )
+                            await self._apply_streaming_profile(False)
+                    else:
+                        misses = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                decky.logger.error(f"streaming watcher error: {e}")
+            await asyncio.sleep(STREAMING_POLL_INTERVAL)
+
     def _install_dispatcher(self):
         try:
             template_path = os.path.join(
@@ -532,10 +738,19 @@ class Plugin:
             distro = self._detect_distro()
             settings["distro_id"] = distro["id"]
             settings["distro_name"] = distro["name"]
+            # streaming_active is runtime state; never trust a stale value
+            # from before a crash/reboot. The watcher re-detects within one
+            # poll interval.
+            settings["streaming_active"] = False
+            settings["streaming_detected_app"] = ""
             _save_settings(settings)
 
             if settings.get("auto_fix_on_wake", True):
                 self._install_dispatcher()
+
+            self._streaming_watcher_task = asyncio.create_task(
+                self._streaming_watcher()
+            )
 
             # Apply volatile settings that may have been lost on reboot.
             # The dispatcher handles reconnects, but on a fresh boot WiFi
@@ -543,8 +758,10 @@ class Plugin:
             # Order: buffer tuning first (sets txqueuelen), then CAKE
             # (overrides txqueuelen to 256), then power_save last (sticks
             # after any reconnects the dispatcher might trigger).
+            # With streaming auto mode on, the gate is closed at boot and the
+            # watcher applies these when it detects a streaming app instead.
             iface = self._get_wifi_interface()
-            if iface:
+            if iface and self._volatile_gate_open(settings):
                 if settings.get("buffer_tuning_enabled"):
                     try:
                         await self.set_buffer_tuning(True)
@@ -593,6 +810,9 @@ class Plugin:
             task = getattr(self, "_backend_switch_task", None)
             if task and not task.done():
                 task.cancel()
+            watcher = getattr(self, "_streaming_watcher_task", None)
+            if watcher and not watcher.done():
+                watcher.cancel()
         except Exception as e:
             decky.logger.error(f"_unload error: {e}")
 
@@ -835,6 +1055,15 @@ class Plugin:
                 "drift": {},
             }
 
+            # Streaming auto mode: expose runtime state and gate drift checks -
+            # with the gate closed, stock settings are the DESIRED state and
+            # must not be reported as drift.
+            gate_open = self._volatile_gate_open(settings)
+            status["live"]["streaming_active"] = settings.get("streaming_active", False)
+            status["live"]["streaming_detected_app"] = settings.get(
+                "streaming_detected_app", ""
+            )
+
             # Backend info is system-wide; populate regardless of connection state
             backend_available = self._has_backend_tool()
             status["live"]["backend_tool_available"] = backend_available
@@ -868,7 +1097,7 @@ class Plugin:
             )
             ps_off = "Power save: off" in ps_result.get("stdout", "")
             status["live"]["power_save_off"] = ps_off
-            if settings.get("power_save_disabled") and not ps_off:
+            if settings.get("power_save_disabled") and not ps_off and gate_open:
                 status["drift"]["power_save"] = True
 
             # Link info
@@ -1009,13 +1238,17 @@ class Plugin:
             )
             current_rmem = sysctl_result.get("stdout", "").strip()
             status["live"]["buffer_tuning_applied"] = current_rmem == "16777216"
-            if settings.get("buffer_tuning_enabled") and current_rmem != "16777216":
+            if (
+                settings.get("buffer_tuning_enabled")
+                and current_rmem != "16777216"
+                and gate_open
+            ):
                 status["drift"]["buffer_tuning"] = True
 
             # CAKE QoS
             cake_active = self._get_cake_status(iface)
             status["live"]["cake_applied"] = cake_active
-            if settings.get("cake_enabled") and not cake_active:
+            if settings.get("cake_enabled") and not cake_active and gate_open:
                 status["drift"]["cake"] = True
 
             # Dispatcher
@@ -1037,25 +1270,22 @@ class Plugin:
 
     async def set_power_save(self, disabled: bool) -> dict:
         try:
+            settings = _load_settings()
+            streaming_mode = settings.get("streaming_mode_enabled", False)
+            # With streaming auto mode on and no stream running, enabling the
+            # fix only records intent; the watcher applies it on detection.
+            # Disabling always reverts the runtime state immediately.
+            effective = disabled and self._volatile_gate_open(settings)
 
-            iface = self._get_wifi_interface()
+            result = self._apply_power_save_now(effective)
+            if not result["success"]:
+                return result
 
-            # Apply immediately if connected - verify before saving
-            if iface:
-                state = "off" if disabled else "on"
-                result = self._run_cmd(
-                    ["/usr/bin/iw", "dev", iface, "set", "power_save", state]
-                )
-                if not result["success"]:
-                    return {
-                        "success": False,
-                        "error": "iw_failed",
-                        "message": "Couldn't change WiFi power save",
-                        "detail": result["stderr"],
-                    }
-
-            # Write or remove NM config (persistent layer)
-            if disabled:
+            # NM config is the persistent layer read by NetworkManager on
+            # every reconnect. In streaming mode we skip it - it would force
+            # power save off around the clock; the dispatcher and watcher
+            # handle reconnects instead.
+            if disabled and not streaming_mode:
                 os.makedirs(os.path.dirname(NM_CONF_PATH), exist_ok=True)
                 with open(NM_CONF_PATH, "w") as f:
                     f.write("[connection]\nwifi.powersave = 2\n")
@@ -1064,9 +1294,6 @@ class Plugin:
                     os.remove(NM_CONF_PATH)
                 except FileNotFoundError:
                     pass
-
-            self._apply_driver_fixes(disabled)
-            self._apply_pcie_aspm_fix(disabled)
 
             # Save settings only after success
             settings = _load_settings()
@@ -1328,26 +1555,11 @@ class Plugin:
 
     async def set_buffer_tuning(self, enabled: bool) -> dict:
         try:
-
-            params = SYSCTL_PARAMS if enabled else SYSCTL_DEFAULTS
-            for key, value in params.items():
-                result = self._run_cmd(
-                    ["/usr/bin/sysctl", "-w", f"{key}={value}"]
-                )
-                if not result["success"]:
-                    decky.logger.error(f"sysctl {key}={value} failed: {result['stderr']}")
-
-            # TX queue length (CAKE needs 256; defer to it if active)
-            iface = self._get_wifi_interface()
             settings = _load_settings()
-            if iface:
-                if settings.get("cake_enabled"):
-                    txq = "256"
-                else:
-                    txq = "2000" if enabled else "1000"
-                self._run_cmd(
-                    ["/usr/bin/ip", "link", "set", iface, "txqueuelen", txq]
-                )
+            # In streaming auto mode with no stream running, only record
+            # intent; the watcher applies the tuning on detection.
+            effective = enabled and self._volatile_gate_open(settings)
+            self._apply_buffer_tuning_now(effective, settings)
 
             settings["buffer_tuning_enabled"] = enabled
             _save_settings_with_timestamp(settings)
@@ -1364,39 +1576,24 @@ class Plugin:
     async def set_cake(self, enabled: bool) -> dict:
         """Enable or disable CAKE QoS (unlimited mode: FQ + AQM + ack-filter, no bandwidth shaper)."""
         try:
+            settings = _load_settings()
             iface = self._get_wifi_interface()
             if not iface:
                 if enabled:
                     return {"success": False, "error": "no_wifi", "message": "Not connected to WiFi."}
-                settings = _load_settings()
                 settings["cake_enabled"] = False
                 _save_settings_with_timestamp(settings)
                 return {"success": True, "cake": False}
 
-            if enabled:
-                modprobe = "/usr/bin/modprobe" if os.path.isfile("/usr/bin/modprobe") else "/usr/sbin/modprobe"
-                self._run_cmd([modprobe, "sch_cake"], timeout=5)
-                result = self._run_cmd([
-                    "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
-                    "cake", "unlimited", "diffserv4", "nat", "ack-filter",
-                ])
-                if not result["success"]:
-                    return {
-                        "success": False,
-                        "error": "unexpected",
-                        "message": "Failed to apply CAKE qdisc.",
-                        "detail": result.get("stderr", ""),
-                    }
-                # Lower txqueuelen to complement CAKE's queue management
-                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"])
-                decky.logger.info(f"CAKE enabled (unlimited) on {iface}")
-            else:
-                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
-                # Restore txqueuelen based on whether buffer tuning is active
-                settings = _load_settings()
-                txq = "2000" if settings.get("buffer_tuning_enabled") else "1000"
-                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", txq])
-                decky.logger.info(f"CAKE disabled on {iface}")
+            # In streaming auto mode with no stream running, only record
+            # intent; the watcher installs the qdisc on detection.
+            effective = enabled and self._volatile_gate_open(settings)
+            result = self._apply_cake_now(effective, settings)
+            if enabled and effective and not result["success"]:
+                return result
+            decky.logger.info(
+                f"CAKE {'enabled (unlimited)' if effective else 'disabled'} on {iface}"
+            )
 
             settings = _load_settings()
             settings["cake_enabled"] = enabled
@@ -1405,6 +1602,96 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"set_cake error: {e}")
             return self._unexpected_response(e)
+
+    async def set_streaming_mode(self, enabled: bool) -> dict:
+        """Master toggle for streaming auto mode. When turning it on, run one
+        immediate detection pass so an already-running stream is picked up
+        without waiting for the watcher; when turning it off, fall back to the
+        global toggles (apply immediately if any are enabled)."""
+        try:
+            settings = _load_settings()
+            settings["streaming_mode_enabled"] = enabled
+
+            if enabled:
+                detected = await asyncio.to_thread(
+                    self._detect_streaming_app, settings
+                )
+                settings["streaming_active"] = bool(detected)
+                settings["streaming_detected_app"] = detected or ""
+                _save_settings_with_timestamp(settings)
+                # NM conf would force power save off around the clock; the
+                # watcher/dispatcher own that now.
+                try:
+                    os.remove(NM_CONF_PATH)
+                except FileNotFoundError:
+                    pass
+                await self._apply_streaming_profile(bool(detected))
+                decky.logger.info(
+                    f"Streaming auto mode enabled (detected: {detected or 'none'})"
+                )
+            else:
+                settings["streaming_active"] = False
+                settings["streaming_detected_app"] = ""
+                _save_settings_with_timestamp(settings)
+                # Restore the persistent NM layer if the user wants power
+                # save off globally.
+                if settings.get("power_save_disabled"):
+                    os.makedirs(os.path.dirname(NM_CONF_PATH), exist_ok=True)
+                    with open(NM_CONF_PATH, "w") as f:
+                        f.write("[connection]\nwifi.powersave = 2\n")
+                await self._apply_streaming_profile(True)
+                decky.logger.info("Streaming auto mode disabled - global toggles active")
+
+            settings = _load_settings()
+            return {
+                "success": True,
+                "streaming_mode_enabled": enabled,
+                "streaming_active": settings.get("streaming_active", False),
+                "streaming_detected_app": settings.get("streaming_detected_app", ""),
+            }
+        except Exception as e:
+            decky.logger.error(f"set_streaming_mode error: {e}")
+            return self._unexpected_response(e)
+
+    async def set_streaming_app(self, app_id: str, enabled: bool) -> dict:
+        """Enable/disable detection for one preset streaming app."""
+        try:
+            if app_id not in STREAMING_APPS:
+                return {
+                    "success": False,
+                    "error": "unexpected",
+                    "message": f"Unknown streaming app '{app_id}'",
+                }
+            settings = _load_settings()
+            apps = dict(settings.get("streaming_apps", {}))
+            apps[app_id] = enabled
+            settings["streaming_apps"] = apps
+            _save_settings(settings)
+            return {"success": True, "app_id": app_id, "enabled": enabled}
+        except Exception as e:
+            decky.logger.error(f"set_streaming_app error: {e}")
+            return self._unexpected_response(e)
+
+    async def set_streaming_custom_patterns(self, patterns: str) -> dict:
+        """Store user-defined process patterns (space/comma separated)."""
+        try:
+            settings = _load_settings()
+            settings["streaming_custom_patterns"] = (patterns or "").strip()
+            _save_settings(settings)
+            return {"success": True, "patterns": settings["streaming_custom_patterns"]}
+        except Exception as e:
+            decky.logger.error(f"set_streaming_custom_patterns error: {e}")
+            return self._unexpected_response(e)
+
+    async def get_streaming_apps(self) -> dict:
+        """Return the preset app catalog for the UI (labels + ids)."""
+        return {
+            "success": True,
+            "apps": [
+                {"id": app_id, "label": info["label"]}
+                for app_id, info in STREAMING_APPS.items()
+            ],
+        }
 
     async def optimize_safe(self) -> dict:
         """Apply universally-safe optimizations: power save, BSSID lock, auto-fix, buffer tuning."""
@@ -1457,6 +1744,10 @@ class Plugin:
         """Reapply volatile (non-reconnecting) settings. Safe to call mid-stream."""
         try:
             settings = _load_settings()
+            if not self._volatile_gate_open(settings):
+                # Streaming auto mode with no stream running: standard
+                # settings are the desired state, nothing to reapply.
+                return {"success": True, "applied": 0, "total": 0, "gated": True}
             applied = 0
             total = 0
 
@@ -1658,9 +1949,22 @@ class Plugin:
             decky.logger.error(f"set_update_channel error: {e}")
             return self._unexpected_response(e)
 
+    # Fork note: self-update is disabled. The upstream updater would fetch
+    # ArcadaLabs-Jason/WifiOptimizer and overwrite the streaming-mode changes.
+    # Point UPDATE_REPO at your own GitHub fork ("user/repo") to re-enable.
+    UPDATE_REPO = ""
+
     async def check_for_update(self) -> dict:
         """Check GitHub for a newer version (stable release or beta branch)."""
         try:
+            if not self.UPDATE_REPO:
+                return {
+                    "success": True,
+                    "current_version": decky.DECKY_PLUGIN_VERSION,
+                    "update_available": False,
+                    "channel": "stable",
+                    "message": "Updates disabled in this fork",
+                }
             current = decky.DECKY_PLUGIN_VERSION
             settings = _load_settings()
             channel = settings.get("update_channel", "stable")
@@ -1752,6 +2056,8 @@ class Plugin:
     async def apply_update(self) -> dict:
         """Download and install update from the selected channel, then restart Decky."""
         try:
+            if not self.UPDATE_REPO:
+                return {"success": False, "message": "Updates disabled in this fork."}
             info = await self.check_for_update()
             if not info.get("update_available"):
                 return {"success": False, "message": "No update available."}

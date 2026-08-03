@@ -1,3 +1,17 @@
+# WiFi Optimizer Streaming (Fork)
+
+This is a fork of [ArcadaLabs-Jason/WifiOptimizer](https://github.com/ArcadaLabs-Jason/WifiOptimizer) (BSD-3-Clause) that adds a **streaming auto mode**:
+
+- **Only fix while streaming:** the volatile fixes (WiFi power save / PCIe ASPM, buffer tuning, CAKE) are applied automatically when a streaming app starts and reverted to stock settings when it exits. Outside of streaming sessions the Deck keeps its normal power management and battery life.
+- **App detection via process watcher:** GeForce NOW, Moonlight, Chiaki, Steam Link, Greenlight, Parsec and Xbox Cloud Gaming are detected out of the box - each individually toggleable - plus a free-form field for custom process patterns.
+- **Everything stays toggleable:** with auto mode off, the plugin behaves exactly like upstream (fixes apply globally).
+- The NetworkManager dispatcher respects the auto mode too, so a reconnect or sleep/wake won't apply fixes while no stream is running.
+- In-app self-update is disabled in this fork so upstream releases can't overwrite it.
+
+Original README below.
+
+---
+
 # WiFi Optimizer v0.11.6
 
 > **Heads up:** This plugin modifies WiFi and network settings. Some optimizations (band preference, custom DNS, WiFi backend switch) can temporarily prevent WiFi from connecting. If this happens, a reboot usually fixes it. You can also try forgetting and rejoining your WiFi network from Steam settings.

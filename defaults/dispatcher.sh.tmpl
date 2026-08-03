@@ -27,6 +27,9 @@ if [ ! -d "$PLUGIN_DIR" ]; then
 fi
 
 # Read all settings in a single Python call for speed (<50ms)
+# VOLATILE_GATE: with streaming auto mode on, volatile fixes are only applied
+# while a streaming app is running (streaming_active, maintained by the
+# plugin's process watcher). Gate closed -> leave stock settings alone.
 if [ -f "$SETTINGS_FILE" ] && [ -r "$SETTINGS_FILE" ]; then
     eval $(python3 -c "
 import json
@@ -37,17 +40,21 @@ try:
     v=d.get('driver','unknown')
     print(f'DRIVER={v if v.isalnum() or v.replace(\"_\",\"\").isalnum() else \"unknown\"}')
     print(f'CAKE={\"True\" if d.get(\"cake_enabled\",False) else \"False\"}')
+    gate=(not d.get('streaming_mode_enabled',False)) or d.get('streaming_active',False)
+    print(f'VOLATILE_GATE={\"True\" if gate else \"False\"}')
 except:
     print('POWER_SAVE=True')
     print('BUFFER_TUNING=False')
     print('DRIVER=unknown')
     print('CAKE=False')
+    print('VOLATILE_GATE=True')
 " 2>/dev/null)
 else
     POWER_SAVE="True"
     BUFFER_TUNING="False"
     DRIVER="unknown"
     CAKE="False"
+    VOLATILE_GATE="True"
     logger -t "$LOG_TAG" "Settings missing, safe defaults only"
 fi
 
@@ -57,7 +64,14 @@ if [ -z "$POWER_SAVE" ]; then
     BUFFER_TUNING="False"
     DRIVER="unknown"
     CAKE="False"
+    VOLATILE_GATE="True"
     logger -t "$LOG_TAG" "Settings parse failed, safe defaults only"
+fi
+
+if [ "$VOLATILE_GATE" != "True" ]; then
+    logger -t "$LOG_TAG" "Streaming auto mode: no stream active, skipping volatile fixes"
+    date +%s > "$SETTINGS_DIR/last_enforced" 2>/dev/null
+    exit 0
 fi
 
 # Apply power save

@@ -6,6 +6,7 @@ import type {
   UpdateCheckResult,
   BackendSwitchStartResult,
   BackendSwitchStatus,
+  StreamingAppsResult,
 } from "./types";
 
 export const getStatus = callable<[], PluginStatus>("get_status");
@@ -17,6 +18,10 @@ export const setDns = callable<[enabled: boolean, provider: string, customServer
 export const setIpv6 = callable<[disabled: boolean], MethodResult>("set_ipv6");
 export const setBufferTuning = callable<[enabled: boolean], MethodResult>("set_buffer_tuning");
 export const setCake = callable<[enabled: boolean], MethodResult>("set_cake");
+export const setStreamingMode = callable<[enabled: boolean], MethodResult>("set_streaming_mode");
+export const setStreamingApp = callable<[appId: string, enabled: boolean], MethodResult>("set_streaming_app");
+export const setStreamingCustomPatterns = callable<[patterns: string], MethodResult>("set_streaming_custom_patterns");
+export const getStreamingApps = callable<[], StreamingAppsResult>("get_streaming_apps");
 export const optimizeSafe = callable<[], OptimizeSafeResult>("optimize_safe");
 export const reapplyAll = callable<[], OptimizeSafeResult>("reapply_all");
 export const reapplyVolatile = callable<[], MethodResult>("reapply_volatile");
