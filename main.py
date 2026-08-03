@@ -118,7 +118,11 @@ DNS_PROVIDERS = {
 # launched as a Steam shortcut, from desktop mode, or via a browser kiosk.
 STREAMING_APPS = {
     "moonlight": {"label": "Moonlight", "patterns": ["moonlight"]},
-    "geforce_now": {"label": "GeForce NOW", "patterns": ["geforcenow", "play.geforcenow.com"]},
+    # GFN on the Deck is the com.nvidia.geforcenow flatpak (NVIDIA's launcher
+    # script wraps `flatpak run`); the URL pattern covers browser/kiosk use.
+    # The full flatpak ID avoids false positives from unrelated command lines
+    # that merely mention "geforcenow".
+    "geforce_now": {"label": "GeForce NOW", "patterns": ["com.nvidia.geforcenow", "play.geforcenow.com"]},
     "chiaki": {"label": "Chiaki (PS Remote Play)", "patterns": ["chiaki"]},
     "steam_link": {"label": "Steam Link", "patterns": ["steamlink"]},
     "greenlight": {"label": "Greenlight (Xbox)", "patterns": ["greenlight"]},
