@@ -53,7 +53,7 @@ jobs:
 
       - name: Syntax-check backend
         run: |
-          python3 -m py_compile main.py
+          python3 -m compileall -q main.py py_modules/wifioptimizer
           bash -n defaults/dispatcher.sh.tmpl
           bash -n install.sh
 
@@ -68,12 +68,15 @@ jobs:
       - name: Package plugin zip
         run: |
           PLUGIN="WiFi Optimizer Streaming"
-          mkdir -p "pack/$PLUGIN/dist" "pack/$PLUGIN/defaults" "pack/$PLUGIN/py_modules"
+          mkdir -p "pack/$PLUGIN/dist" "pack/$PLUGIN/defaults"
           cp plugin.json package.json main.py decky.pyi LICENSE README.md "pack/$PLUGIN/"
           cp dist/index.js "pack/$PLUGIN/dist/"
           cp dist/index.js.map "pack/$PLUGIN/dist/" 2>/dev/null || true
           cp defaults/dispatcher.sh.tmpl "pack/$PLUGIN/defaults/"
-          touch "pack/$PLUGIN/py_modules/.keep"
+          # The backend package ships with the plugin; strip caches from the
+          # compileall step above.
+          cp -r py_modules "pack/$PLUGIN/"
+          find "pack/$PLUGIN/py_modules" -name "__pycache__" -type d -prune -exec rm -rf {} +
           VERSION=$(python3 -c "import json;print(json.load(open('package.json'))['version'])")
           cd pack && zip -r "../wifi-optimizer-streaming-$VERSION.zip" "$PLUGIN"
           cd ..
