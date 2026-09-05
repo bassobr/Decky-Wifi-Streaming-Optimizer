@@ -119,64 +119,157 @@ class BackendSwitchMixin:
             return "Network problem during the switch. Check WiFi and try again."
         return "The WiFi backend switch didn't take effect."
 
-    async def _backend_switch_worker(self, target: str):
-        """Background task that switches the WiFi backend with phase transitions.
+    # ---- Switch execution ----
+    #
+    # Both switch methods (SteamOS helper vs. generic NM-conf + systemd) share
+    # the same frame: phase transitions, the reconnect wait, runtime
+    # verification (FUNC-04), result assembly, and the cancel/error handling.
+    # _run_backend_switch owns that frame; the per-method `step` coroutine
+    # only performs the actual switch and reports what happened via a dict:
+    #
+    #   {"failed_early": True, "message": ..., "detail": ...}
+    #     terminal failure before/while switching - frame records it and stops
+    #   {"failed_early": False, "restart_ok": bool, "detail": str,
+    #    "recovery_performed": bool, "needs_reboot": bool}
+    #     switch commands ran; frame waits for reconnect, verifies, reports
 
-        Invokes the privileged helper directly (at /usr/bin/steamos-polkit-helpers/…)
-        to bypass pkexec, which fails from a rootful systemd context with no polkit
-        agent. The helper handles wlan0 recovery on ath11k devices internally; we parse its
-        output to report whether recovery fired.
-        """
+    async def _steamos_switch_step(self, target: str, other: str) -> dict:
+        """Switch via Valve's privileged helper, invoked directly (at
+        /usr/bin/steamos-polkit-helpers/…) to bypass pkexec, which fails from
+        a rootful systemd context with no polkit agent. The helper handles
+        wlan0 recovery on ath11k devices internally; we parse its output to
+        report whether recovery fired."""
+        settings = settings_store.load_settings()
+        has_wlan0_quirk = settings.get("driver") == "ath11k_pci"
+
+        # clean_env=True clears LD_LIBRARY_PATH so bash doesn't hit a symbol
+        # lookup error against Decky's bundled readline (same class of bug
+        # as the curl/OpenSSL conflict).
+        decky.logger.info(
+            f"backend switch: calling helper write_config target={target} "
+            f"(euid={os.geteuid()}, helper={BACKEND_HELPER})"
+        )
+        write_result = await asyncio.to_thread(
+            self._run_cmd, [BACKEND_HELPER, "write_config", target], 5, True
+        )
+        decky.logger.info(
+            f"backend switch: write_config result rc={write_result.get('returncode')} "
+            f"stdout={write_result.get('stdout', '')[:200]!r} "
+            f"stderr={write_result.get('stderr', '')[:200]!r}"
+        )
+        if not write_result["success"]:
+            detail = (write_result.get("stderr") or write_result.get("stdout") or "")[:200]
+            decky.logger.error(
+                f"backend switch failed at write_config: rc={write_result.get('returncode')}, "
+                f"detail={detail!r}"
+            )
+            return {
+                "failed_early": True,
+                "message": self._friendly_backend_error(detail),
+                "detail": detail,
+            }
+
+        restart_result = await asyncio.to_thread(
+            self._run_cmd, [BACKEND_HELPER, "restart_units", other], 45, True
+        )
+        rs_stdout = restart_result.get("stdout", "")
+        rs_stderr = restart_result.get("stderr", "")
+        recovery_performed = "missing wlan0" in rs_stdout
+        needs_reboot = "wlan0 could not be created" in rs_stderr
+
+        await asyncio.sleep(1)
+        if has_wlan0_quirk and target == "wpa_supplicant":
+            iface_check = await asyncio.to_thread(self._get_wifi_interface)
+            if iface_check != "wlan0":
+                needs_reboot = True
+
+        return {
+            "failed_early": False,
+            "restart_ok": restart_result["success"],
+            "detail": rs_stderr[:200] or rs_stdout[:200],
+            "recovery_performed": recovery_performed,
+            "needs_reboot": needs_reboot,
+        }
+
+    async def _generic_switch_step(self, target: str, other: str) -> dict:
+        """Switch for non-SteamOS systems (Bazzite, CachyOS, etc.): write the
+        NM config directly and manage the systemd services."""
+        # Fail fast if the target service doesn't exist on this distro -
+        # otherwise we'd write the NM config, kill the working backend,
+        # and only find out afterwards (FUNC-04).
+        if not await asyncio.to_thread(self._backend_unit_available, target):
+            return {
+                "failed_early": True,
+                "message": f"The {target} service is not installed on this system.",
+                "detail": "",
+            }
+
+        decky.logger.info(f"generic backend switch: {other} -> {target}")
+
+        os.makedirs(os.path.dirname(GENERIC_BACKEND_CONF), exist_ok=True)
+        if target == "iwd":
+            with open(GENERIC_BACKEND_CONF, "w") as f:
+                f.write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
+        else:
+            with open(GENERIC_BACKEND_CONF, "w") as f:
+                f.write("[device]\nwifi.backend=wpa_supplicant\n")
+
+        # Stop old, enable + start new, restart NM
+        for cmd in [
+            ["/usr/bin/systemctl", "stop", other],
+            ["/usr/bin/systemctl", "disable", other],
+            ["/usr/bin/systemctl", "enable", target],
+            ["/usr/bin/systemctl", "start", target],
+        ]:
+            await asyncio.to_thread(self._run_cmd, cmd, 10, True)
+
+        restart = await asyncio.to_thread(
+            self._run_cmd,
+            ["/usr/bin/systemctl", "restart", "NetworkManager"],
+            15,
+            True,
+        )
+        if not restart["success"]:
+            detail = restart.get("stderr", "")[:200]
+            return {
+                "failed_early": True,
+                "message": self._friendly_backend_error(detail),
+                "detail": detail,
+            }
+
+        return {
+            "failed_early": False,
+            "restart_ok": True,
+            "detail": "",
+            "recovery_performed": False,
+            "needs_reboot": False,
+        }
+
+    async def _run_backend_switch(self, target: str, step, method_label: str):
+        """Shared frame around a switch step: phases, reconnect wait, runtime
+        verification, result assembly, and cancel/error handling."""
         try:
-            settings = settings_store.load_settings()
-            has_wlan0_quirk = settings.get("driver") == "ath11k_pci"
+            self._ensure_backend_switch_state()
             other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
-
-            # Phase: switching - write config then restart services.
-            # clean_env=True clears LD_LIBRARY_PATH so bash doesn't hit a symbol
-            # lookup error against Decky's bundled readline (same class of bug
-            # as the curl/OpenSSL conflict).
             self._backend_switch["phase"] = "switching"
-            decky.logger.info(
-                f"backend switch: calling helper write_config target={target} "
-                f"(euid={os.geteuid()}, helper={BACKEND_HELPER})"
-            )
-            write_result = await asyncio.to_thread(
-                self._run_cmd, [BACKEND_HELPER, "write_config", target], 5, True
-            )
-            decky.logger.info(
-                f"backend switch: write_config result rc={write_result.get('returncode')} "
-                f"stdout={write_result.get('stdout', '')[:200]!r} "
-                f"stderr={write_result.get('stderr', '')[:200]!r}"
-            )
-            if not write_result["success"]:
-                detail = (write_result.get("stderr") or write_result.get("stdout") or "")[:200]
+
+            outcome = await step(target, other)
+            if outcome.get("failed_early"):
                 self._backend_switch["phase"] = "failed"
-                self._backend_switch["result"] = {
+                result = {
                     "success": False,
                     "target": target,
-                    "message": self._friendly_backend_error(detail),
-                    "detail": detail,
+                    "message": outcome.get("message", "Backend switch failed."),
                 }
-                decky.logger.error(
-                    f"backend switch failed at write_config: rc={write_result.get('returncode')}, "
-                    f"detail={detail!r}"
-                )
+                if outcome.get("detail"):
+                    result["detail"] = outcome["detail"]
+                self._backend_switch["result"] = result
                 return
 
-            restart_result = await asyncio.to_thread(
-                self._run_cmd, [BACKEND_HELPER, "restart_units", other], 45, True
-            )
-            rs_stdout = restart_result.get("stdout", "")
-            rs_stderr = restart_result.get("stderr", "")
-            recovery_performed = "missing wlan0" in rs_stdout
-            needs_reboot = "wlan0 could not be created" in rs_stderr
-
-            await asyncio.sleep(1)
-            if has_wlan0_quirk and target == "wpa_supplicant":
-                iface_check = await asyncio.to_thread(self._get_wifi_interface)
-                if iface_check != "wlan0":
-                    needs_reboot = True
+            restart_ok = outcome.get("restart_ok", True)
+            recovery_performed = outcome.get("recovery_performed", False)
+            needs_reboot = outcome.get("needs_reboot", False)
+            detail = outcome.get("detail", "")
 
             # Phase: reconnecting. Poll nmcli at 1-second cadence for up to 15s
             # to confirm WiFi actually comes back. 15s is generous for typical
@@ -185,22 +278,19 @@ class BackendSwitchMixin:
             reconnect_timed_out = False
             if not needs_reboot:
                 self._backend_switch["phase"] = "reconnecting"
-                elapsed = 0
                 reconnected = False
-                while elapsed < 15:
+                for _ in range(15):
                     iface = await asyncio.to_thread(self._get_wifi_interface)
-                    uuid = None
                     if iface:
                         uuid = await asyncio.to_thread(self._get_active_connection_uuid)
-                    if iface and uuid:
-                        reconnected = True
-                        break
+                        if uuid:
+                            reconnected = True
+                            break
                     await asyncio.sleep(1)
-                    elapsed += 1
                 reconnect_timed_out = not reconnected
 
             # Verify final state. _get_current_backend reads the conf the
-            # helper just wrote, so alone it would only confirm our own write
+            # switch just wrote, so alone it would only confirm our own write
             # (FUNC-04); additionally require the target service to actually
             # run, or WiFi to have come back, before calling this a success.
             final_backend = await asyncio.to_thread(self._get_current_backend)
@@ -217,12 +307,19 @@ class BackendSwitchMixin:
                     "message": "Backend switched but wlan0 didn't come back. Reboot required.",
                 }
             elif (
-                not restart_result["success"]
+                not restart_ok
                 or final_backend != target
                 or (reconnect_timed_out and not service_active)
             ):
-                detail = rs_stderr[:200] or rs_stdout[:200]
-                if not detail and reconnect_timed_out and not service_active:
+                if detail:
+                    message = self._friendly_backend_error(detail)
+                elif final_backend != target:
+                    message = f"Expected {target} but got {final_backend}. A reboot may help."
+                else:
+                    message = (
+                        f"Config switched to {target} but its service isn't running. "
+                        "A reboot may help."
+                    )
                     detail = f"{target} service is not running"
                 self._backend_switch["phase"] = "failed"
                 self._backend_switch["result"] = {
@@ -232,7 +329,7 @@ class BackendSwitchMixin:
                     "recovery_performed": recovery_performed,
                     "needs_reboot": False,
                     "reconnect_timed_out": reconnect_timed_out,
-                    "message": self._friendly_backend_error(detail),
+                    "message": message,
                     "detail": detail,
                 }
             else:
@@ -246,7 +343,7 @@ class BackendSwitchMixin:
                     "reconnect_timed_out": reconnect_timed_out,
                 }
             decky.logger.info(
-                f"backend switch: target={target}, final={final_backend}, "
+                f"backend switch ({method_label}): target={target}, final={final_backend}, "
                 f"recovery={recovery_performed}, needs_reboot={needs_reboot}, "
                 f"reconnect_timed_out={reconnect_timed_out}"
             )
@@ -259,7 +356,7 @@ class BackendSwitchMixin:
             }
             raise
         except Exception as e:
-            decky.logger.error(f"_backend_switch_worker error: {e}")
+            decky.logger.error(f"backend switch worker ({method_label}) error: {e}")
             self._backend_switch["phase"] = "failed"
             self._backend_switch["result"] = {
                 "success": False,
@@ -268,131 +365,14 @@ class BackendSwitchMixin:
             }
         finally:
             self._backend_switch["in_progress"] = False
+
+    async def _backend_switch_worker(self, target: str):
+        """Background task: SteamOS switch via the privileged helper."""
+        await self._run_backend_switch(target, self._steamos_switch_step, "steamos")
 
     async def _generic_backend_switch_worker(self, target: str):
-        """Backend switch for non-SteamOS systems (Bazzite, CachyOS, etc.).
-        Writes NM config directly and manages systemd services."""
-        try:
-            other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
-
-            # Fail fast if the target service doesn't exist on this distro -
-            # otherwise we'd write the NM config, kill the working backend,
-            # and only find out afterwards (FUNC-04).
-            if not await asyncio.to_thread(self._backend_unit_available, target):
-                self._backend_switch["phase"] = "failed"
-                self._backend_switch["result"] = {
-                    "success": False,
-                    "target": target,
-                    "message": f"The {target} service is not installed on this system.",
-                }
-                return
-
-            self._backend_switch["phase"] = "switching"
-            decky.logger.info(f"generic backend switch: {other} -> {target}")
-
-            os.makedirs(os.path.dirname(GENERIC_BACKEND_CONF), exist_ok=True)
-            if target == "iwd":
-                with open(GENERIC_BACKEND_CONF, "w") as f:
-                    f.write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
-            else:
-                with open(GENERIC_BACKEND_CONF, "w") as f:
-                    f.write("[device]\nwifi.backend=wpa_supplicant\n")
-
-            # Stop old, enable + start new, restart NM
-            for cmd in [
-                ["/usr/bin/systemctl", "stop", other],
-                ["/usr/bin/systemctl", "disable", other],
-                ["/usr/bin/systemctl", "enable", target],
-                ["/usr/bin/systemctl", "start", target],
-            ]:
-                await asyncio.to_thread(self._run_cmd, cmd, 10, True)
-
-            restart = await asyncio.to_thread(
-                self._run_cmd,
-                ["/usr/bin/systemctl", "restart", "NetworkManager"],
-                15,
-                True,
-            )
-            if not restart["success"]:
-                detail = restart.get("stderr", "")[:200]
-                self._backend_switch["phase"] = "failed"
-                self._backend_switch["result"] = {
-                    "success": False,
-                    "target": target,
-                    "message": self._friendly_backend_error(detail),
-                    "detail": detail,
-                }
-                return
-
-            # Phase: reconnecting
-            self._backend_switch["phase"] = "reconnecting"
-            reconnect_timed_out = True
-            for _ in range(15):
-                await asyncio.sleep(1)
-                iface = await asyncio.to_thread(self._get_wifi_interface)
-                if iface:
-                    uuid = await asyncio.to_thread(self._get_active_connection_uuid)
-                    if uuid:
-                        reconnect_timed_out = False
-                        break
-
-            # _get_current_backend reads the conf we just wrote; require the
-            # target service to actually run (or WiFi to be back) before
-            # reporting success (FUNC-04).
-            final_backend = await asyncio.to_thread(self._get_current_backend)
-            service_active = await asyncio.to_thread(self._backend_service_active, target)
-
-            if final_backend == target and (service_active or not reconnect_timed_out):
-                self._backend_switch["phase"] = "done"
-                self._backend_switch["result"] = {
-                    "success": True,
-                    "backend": final_backend,
-                    "target": target,
-                    "recovery_performed": False,
-                    "needs_reboot": False,
-                    "reconnect_timed_out": reconnect_timed_out,
-                }
-            else:
-                if final_backend != target:
-                    msg = f"Expected {target} but got {final_backend}. A reboot may help."
-                else:
-                    msg = (
-                        f"Config switched to {target} but its service isn't running. "
-                        "A reboot may help."
-                    )
-                self._backend_switch["phase"] = "failed"
-                self._backend_switch["result"] = {
-                    "success": False,
-                    "backend": final_backend,
-                    "target": target,
-                    "recovery_performed": False,
-                    "needs_reboot": False,
-                    "reconnect_timed_out": reconnect_timed_out,
-                    "message": msg,
-                }
-
-            decky.logger.info(
-                f"generic backend switch: target={target}, final={final_backend}, "
-                f"reconnect_timed_out={reconnect_timed_out}"
-            )
-        except asyncio.CancelledError:
-            self._backend_switch["phase"] = "failed"
-            self._backend_switch["result"] = {
-                "success": False,
-                "target": target,
-                "message": "Backend switch cancelled",
-            }
-            raise
-        except Exception as e:
-            decky.logger.error(f"_generic_backend_switch_worker error: {e}")
-            self._backend_switch["phase"] = "failed"
-            self._backend_switch["result"] = {
-                "success": False,
-                "target": target,
-                "message": str(e),
-            }
-        finally:
-            self._backend_switch["in_progress"] = False
+        """Background task: generic switch via NM config + systemd units."""
+        await self._run_backend_switch(target, self._generic_switch_step, "generic")
 
     async def start_backend_switch(self, backend: str) -> dict:
         """Kick off a backend switch. Returns immediately; poll get_backend_switch_status for progress."""
