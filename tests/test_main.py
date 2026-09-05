@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(_ROOT, "py_modules"))
 
 import main  # noqa: E402
 from wifioptimizer import archives, constants, parsing  # noqa: E402
+from wifioptimizer import backend_switch as backend_switch_mod  # noqa: E402
 from wifioptimizer import settings as settings_store  # noqa: E402
 from wifioptimizer.deckyshim import decky  # noqa: E402
 
@@ -386,6 +387,121 @@ def test_reset_settings_does_not_share_defaults(settings_env, plugin, monkeypatc
     # FUNC-09: reset must not hand out the module-level defaults dict
     assert fresh["streaming_apps"] is not constants.DEFAULT_SETTINGS["streaming_apps"]
     assert fresh is not constants.DEFAULT_SETTINGS
+
+
+# ---- backend switch frame ----
+#
+# The two switch methods (SteamOS helper / generic systemd) share one frame:
+# _run_backend_switch owns phases, the reconnect wait, runtime verification,
+# and result assembly. A fake step lets us drive every outcome without
+# touching the system.
+
+OK_STEP = {
+    "failed_early": False,
+    "restart_ok": True,
+    "detail": "",
+    "recovery_performed": False,
+    "needs_reboot": False,
+}
+
+
+def _fake_step(outcome):
+    async def step(target, other):
+        return dict(outcome)
+    return step
+
+
+def _drive_switch(plugin, monkeypatch, outcome, *, final_backend="wpa_supplicant",
+                  service_active=True, connected=True):
+    monkeypatch.setattr(plugin, "_get_current_backend", lambda: final_backend)
+    monkeypatch.setattr(plugin, "_backend_service_active", lambda name: service_active)
+    monkeypatch.setattr(
+        plugin, "_get_wifi_interface", lambda: "wlan0" if connected else None
+    )
+    monkeypatch.setattr(
+        plugin, "_get_active_connection_uuid", lambda: "uuid-1" if connected else None
+    )
+    if not connected:
+        # The reconnect wait sleeps 15x1s; don't make the test suite pay that.
+        async def _no_sleep(_seconds):
+            return None
+        monkeypatch.setattr(backend_switch_mod.asyncio, "sleep", _no_sleep)
+    asyncio.run(
+        plugin._run_backend_switch("wpa_supplicant", _fake_step(outcome), "test")
+    )
+    return plugin._backend_switch
+
+
+def test_switch_frame_success(plugin, monkeypatch):
+    state = _drive_switch(plugin, monkeypatch, OK_STEP)
+    assert state["phase"] == "done"
+    assert state["in_progress"] is False
+    result = state["result"]
+    assert result["success"] is True
+    assert result["backend"] == "wpa_supplicant"
+    assert result["reconnect_timed_out"] is False
+
+
+def test_switch_frame_failed_early(plugin, monkeypatch):
+    outcome = {"failed_early": True, "message": "boom", "detail": "raw stderr"}
+    state = _drive_switch(plugin, monkeypatch, outcome)
+    assert state["phase"] == "failed"
+    assert state["result"]["message"] == "boom"
+    assert state["result"]["detail"] == "raw stderr"
+    # early failures carry no verification fields
+    assert "backend" not in state["result"]
+
+
+def test_switch_frame_needs_reboot(plugin, monkeypatch):
+    outcome = {**OK_STEP, "needs_reboot": True}
+    state = _drive_switch(plugin, monkeypatch, outcome)
+    result = state["result"]
+    assert result["success"] is False
+    assert result["needs_reboot"] is True
+    assert "wlan0" in result["message"]
+    # reconnect wait is skipped on the reboot path
+    assert "reconnect_timed_out" not in result
+
+
+def test_switch_frame_wrong_final_backend(plugin, monkeypatch):
+    state = _drive_switch(plugin, monkeypatch, OK_STEP, final_backend="iwd")
+    result = state["result"]
+    assert result["success"] is False
+    assert "Expected wpa_supplicant but got iwd" in result["message"]
+
+
+def test_switch_frame_service_dead_and_no_reconnect(plugin, monkeypatch):
+    state = _drive_switch(
+        plugin, monkeypatch, OK_STEP, service_active=False, connected=False
+    )
+    result = state["result"]
+    assert result["success"] is False
+    assert result["reconnect_timed_out"] is True
+    assert "service isn't running" in result["message"]
+    assert result["detail"] == "wpa_supplicant service is not running"
+
+
+def test_switch_frame_restart_failure_uses_friendly_error(plugin, monkeypatch):
+    outcome = {**OK_STEP, "restart_ok": False, "detail": "permission denied"}
+    state = _drive_switch(plugin, monkeypatch, outcome)
+    result = state["result"]
+    assert result["success"] is False
+    assert result["message"] == "The system denied permission. Try rebooting."
+    assert result["detail"] == "permission denied"
+
+
+def test_switch_workers_route_through_frame(plugin, monkeypatch):
+    async def fake_step(target, other):
+        assert other == "wpa_supplicant"  # derived from target inside the frame
+        return {"failed_early": True, "message": f"step ran for {target}", "detail": ""}
+
+    monkeypatch.setattr(plugin, "_steamos_switch_step", fake_step)
+    asyncio.run(plugin._backend_switch_worker("iwd"))
+    assert plugin._backend_switch["result"]["message"] == "step ran for iwd"
+
+    monkeypatch.setattr(plugin, "_generic_switch_step", fake_step)
+    asyncio.run(plugin._generic_backend_switch_worker("iwd"))
+    assert plugin._backend_switch["result"]["message"] == "step ran for iwd"
 
 
 # ---- dispatcher rendering ----
