@@ -160,6 +160,16 @@ MIN_PATTERN_LEN = 3
 # characters only.
 VERSION_RE = re.compile(r"^[0-9A-Za-z._-]{1,64}$")
 
+# Release-signing public key (minisign format). CI signs each release's
+# SHA256SUMS with the corresponding seed (GitHub secret MINISIGN_SEED); the
+# updater refuses stable updates whose signature doesn't verify against this
+# pinned key (trust-on-first-use: the first install trusts TLS+GitHub, every
+# update after that trusts only this key). Must stay identical to the
+# committed minisign.pub - a test asserts that.
+MINISIGN_PUBKEY = """untrusted comment: minisign public key 72A411FD74FD614A
+RWRypBH9dP1hSud4CEL0adABUoisOgrxh+9UrPX+DX1larLQNfIRGTgm
+"""
+
 DEFAULT_SETTINGS = {
     "model": "unknown",
     "driver": "unknown",

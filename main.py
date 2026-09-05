@@ -29,8 +29,10 @@ def _self_heal_py_modules() -> bool:
     copied a fixed file list and dropped py_modules/ content, which would
     leave this main.py without its wifioptimizer package after an in-app
     update. Recover the package from this version's own release zip, verified
-    against the release's SHA256SUMS - the same trust path the updater uses.
-    Remove once pre-0.14 installs are extinct."""
+    against the release's SHA256SUMS. Checksum-only by design: the minisign
+    verifier lives in the very package this shim restores, so it can't be
+    used here; the shim only ever re-fetches the same already-installed
+    version. Remove once pre-0.14 installs are extinct."""
     import hashlib
     import json
     import shutil

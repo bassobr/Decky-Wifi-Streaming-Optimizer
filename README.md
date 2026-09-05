@@ -7,7 +7,7 @@ This is a fork of [ArcadaLabs-Jason/WifiOptimizer](https://github.com/ArcadaLabs
 - **Everything stays toggleable:** with auto mode off, the plugin behaves exactly like upstream (fixes apply globally).
 - The NetworkManager dispatcher respects the auto mode too, so a reconnect or sleep/wake won't apply fixes while no stream is running.
 - In-app self-update pulls from this repo ([bassobr/Decky-Wifi-Streaming-Optimizer](https://github.com/bassobr/Decky-Wifi-Streaming-Optimizer)), so upstream releases can't overwrite the fork.
-- **Verified updates:** the installer and the stable-channel self-updater install the CI-built release zip and check it against the release's `SHA256SUMS` before installing. The beta channel installs straight from the beta branch and is not checksummed.
+- **Signed, verified updates:** releases ship a minisign signature (`SHA256SUMS.minisig`) created by CI. The stable-channel self-updater verifies that signature against the public key pinned inside the plugin ([`minisign.pub`](minisign.pub), key ID `72A411FD74FD614A`) before trusting the checksums, then checks the release zip against `SHA256SUMS`. To verify a release manually: `minisign -Vm SHA256SUMS -p minisign.pub`. The installer and the beta channel (branch tarball) rely on TLS + repo trust; signature pinning protects every update after the first install.
 
 ## Install (fork)
 
