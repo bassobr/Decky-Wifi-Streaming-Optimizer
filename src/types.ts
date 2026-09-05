@@ -37,12 +37,7 @@ export interface LiveStatus {
   tx_bitrate?: string;
   frequency?: string;
   channel?: string;
-  connected_bssid?: string;
-  bssid_lock?: string;
   ip_address?: string;
-  dns?: string;
-  ipv6_method?: string;
-  band?: string;
   buffer_tuning_applied?: boolean;
   cake_applied?: boolean;
   dispatcher_installed?: boolean;
@@ -139,14 +134,14 @@ export interface UpdateCheckResult {
   message?: string;
 }
 
-export type BadgeStatus = "active" | "locked" | "set" | "drifted" | "off" | "error" | "unknown";
+export type BadgeStatus = "active" | "drifted" | "off" | "error" | "unknown";
 
+// Keys mirror the error codes main.py actually returns.
 export const ERROR_MESSAGES: Record<string, string> = {
   no_wifi: "Not connected to WiFi. Connect first, then optimize.",
   iw_failed: "Couldn't change WiFi setting. Try toggling WiFi off/on.",
   nmcli_failed: "Couldn't update connection. Forget and reconnect to this network.",
-  timeout: "Command timed out. The system may be busy. Try again.",
   write_failed: "Couldn't install auto-fix script. The filesystem may be locked.",
-  parse_error: "Settings were reset to defaults.",
+  invalid_pattern: "Custom patterns need at least 3 characters each.",
   unexpected: "Something went wrong. Check the Decky log for details.",
 };

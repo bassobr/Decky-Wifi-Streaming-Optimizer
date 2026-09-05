@@ -55,7 +55,7 @@ export function PanelFooter({ version }: PanelFooterProps) {
         <div style={rowStyle}>
           If WiFi won't reconnect, a reboot usually fixes it.
           <br />
-          Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer
+          Bugs? Report at github.com/bassobr/Decky-Wifi-Streaming-Optimizer
         </div>
       </PanelSectionRow>
       <PanelSectionRow>
@@ -66,6 +66,12 @@ export function PanelFooter({ version }: PanelFooterProps) {
         >
           {label}
         </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={rowStyle}>
+          Diagnostics include network identifiers (SSID, MAC/BSSID) - review
+          before sharing.
+        </div>
       </PanelSectionRow>
     </PanelSection>
   );

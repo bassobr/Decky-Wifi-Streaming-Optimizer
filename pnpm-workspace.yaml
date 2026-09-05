@@ -1,0 +1,12 @@
+# pnpm >= 10 reads settings from here (the "pnpm" field in package.json is
+# no longer honored).
+peerDependencyRules:
+  ignoreMissing:
+    - react
+    - react-dom
+
+# DEP-01: pin brace-expansion (transitive via @decky/rollup -> ... -> minimatch)
+# past its ReDoS/DoS advisories. Build-time only, but keeps `pnpm audit` clean.
+overrides:
+  "brace-expansion@^1.0.0": "^1.1.18"
+  "brace-expansion@^2.0.0": "^2.1.4"

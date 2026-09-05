@@ -7,6 +7,7 @@ This is a fork of [ArcadaLabs-Jason/WifiOptimizer](https://github.com/ArcadaLabs
 - **Everything stays toggleable:** with auto mode off, the plugin behaves exactly like upstream (fixes apply globally).
 - The NetworkManager dispatcher respects the auto mode too, so a reconnect or sleep/wake won't apply fixes while no stream is running.
 - In-app self-update pulls from this repo ([bassobr/Decky-Wifi-Streaming-Optimizer](https://github.com/bassobr/Decky-Wifi-Streaming-Optimizer)), so upstream releases can't overwrite the fork.
+- **Verified updates:** the installer and the stable-channel self-updater install the CI-built release zip and check it against the release's `SHA256SUMS` before installing. The beta channel installs straight from the beta branch and is not checksummed.
 
 ## Install (fork)
 
@@ -111,10 +112,10 @@ No background processes, no polling, no battery impact.
 
 **Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This reverts the runtime optimizations (power save, buffer tuning, PCIe ASPM, CAKE) and deletes the plugin's own config files. Per-connection NetworkManager profile changes (BSSID lock, band preference, custom DNS, IPv6) stay on your saved WiFi network - to remove those, forget and rejoin the network from Steam's WiFi settings. The WiFi backend choice (iwd vs wpa_supplicant) is a system-wide setting and isn't touched by the plugin on uninstall.
 
-Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer > Uninstall), or manually:
+Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer Streaming > Uninstall), or manually (note: this fork installs as "WiFi Optimizer Streaming"):
 
 ```bash
-rm -rf ~/homebrew/plugins/WiFi\ Optimizer
+rm -rf ~/homebrew/plugins/WiFi\ Optimizer\ Streaming
 sudo rm -f /etc/NetworkManager/dispatcher.d/99-wifi-optimizer
 sudo rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer.conf
 sudo rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf
@@ -124,14 +125,16 @@ sudo systemctl restart plugin_loader
 
 ## Building from source
 
-Requires Node.js and pnpm v9.
+Requires Node.js and pnpm v11 (the exact version is pinned in `package.json`'s `packageManager` field; `corepack enable` picks it up automatically).
 
 ```bash
-git clone https://github.com/ArcadaLabs-Jason/WifiOptimizer.git
-cd WifiOptimizer
+git clone https://github.com/bassobr/Decky-Wifi-Streaming-Optimizer.git
+cd Decky-Wifi-Streaming-Optimizer
 pnpm i
 pnpm run build
 ```
+
+Backend tests run with `python3 -m pytest tests/ -q`.
 
 To deploy to your Deck, copy `.vscode/defsettings.json` to `.vscode/settings.json`, fill in your Deck's IP and password, then use the VS Code **builddeploy** task (Terminal > Run Task).
 
@@ -142,3 +145,7 @@ Follow development on [Bluesky](https://bsky.app/profile/thefanciestpeanut.bsky.
 ## License
 
 BSD 3-Clause. See [LICENSE](LICENSE).
+
+### Third-party licenses
+
+The built `dist/index.js` bundles [@decky/ui](https://www.npmjs.com/package/@decky/ui) and [@decky/api](https://www.npmjs.com/package/@decky/api) (LGPL-2.1), [react-icons](https://www.npmjs.com/package/react-icons) (MIT), and [tslib](https://www.npmjs.com/package/tslib) (0BSD). This repository contains the full source and build instructions, satisfying the LGPL's relink/modify requirements.
