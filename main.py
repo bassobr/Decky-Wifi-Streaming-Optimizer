@@ -224,6 +224,13 @@ DEFAULT_SETTINGS = {
     "streaming_detected_app": "",
     "last_connection_uuid": "",
     "priority_set": False,
+    # Pre-apply system state, captured when a volatile fix is first applied
+    # and restored (then cleared) when it is reverted - so disabling a fix
+    # brings back the machine's real prior tuning instead of assumed kernel
+    # defaults (FUNC-06).
+    "sysctl_snapshot": {},
+    "txqueuelen_snapshot": "",
+    "pcie_snapshot": {},
     "distro_id": "unknown",
     "distro_name": "Unknown",
     "update_channel": "stable",
@@ -426,6 +433,88 @@ def _safe_extract_tar(tar_path: str, dest: str):
             t.extractall(dest)
 
 
+def _build_patterns(settings: dict) -> list[tuple[str, str]]:
+    """Build the (pattern, label) match list for streaming detection from the
+    preset app toggles plus the user's custom patterns. Custom tokens shorter
+    than MIN_PATTERN_LEN are skipped - they would match half of /proc and pin
+    the streaming gate open."""
+    patterns: list[tuple[str, str]] = []
+    apps_enabled = settings.get("streaming_apps", {})
+    for app_id, info in STREAMING_APPS.items():
+        if apps_enabled.get(app_id, True):
+            for p in info["patterns"]:
+                patterns.append((p, info["label"]))
+    custom = settings.get("streaming_custom_patterns", "") or ""
+    for p in custom.replace(",", " ").split():
+        if len(p) >= MIN_PATTERN_LEN:
+            patterns.append((p.lower(), p))
+    return patterns
+
+
+def _parse_iw_link(out: str) -> dict:
+    """Extract signal/bitrate/frequency from `iw dev <iface> link` output."""
+    info: dict = {}
+    for line in out.split("\n"):
+        line = line.strip()
+        if line.startswith("signal:"):
+            info["signal_dbm"] = line.split(":", 1)[1].strip()
+        elif "tx bitrate:" in line:
+            info["tx_bitrate"] = line.split("tx bitrate:", 1)[1].strip()
+        elif line.startswith("freq:"):
+            info["frequency"] = line.split(":", 1)[1].strip()
+    return info
+
+
+def _parse_iw_channel(out: str) -> str | None:
+    """Parse `iw dev <iface> info` output into "36 (80 MHz)" form."""
+    for line in out.split("\n"):
+        line = line.strip()
+        if line.startswith("channel"):
+            # Raw: "channel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz"
+            parts = line.split(",")
+            chan_num = ""
+            width = ""
+            if parts:
+                tokens = parts[0].split()
+                if len(tokens) >= 2:
+                    chan_num = tokens[1]
+            for part in parts:
+                part = part.strip()
+                if part.startswith("width:"):
+                    width = part.split(":", 1)[1].strip()
+            if chan_num and width:
+                return f"{chan_num} ({width})"
+            if chan_num:
+                return chan_num
+            return line
+    return None
+
+
+def _parse_nmcli_fields(out: str) -> dict:
+    """Parse `nmcli -t -f ...` output into {field: [values]}. Indexed fields
+    like IP4.DNS[1] collapse onto their bare name; escaped colons in values
+    (nmcli writes MACs as AA\\:BB\\:...) are unescaped."""
+    fields: dict = {}
+    for line in out.split("\n"):
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.split("[", 1)[0].strip()
+        if not key:
+            continue
+        fields.setdefault(key, []).append(value.replace("\\:", ":").strip())
+    return fields
+
+
+def _dns_drifted(expected_servers: str, live_dns: list[str]) -> bool:
+    """True when a configured DNS override is missing from the live values."""
+    expected = expected_servers.split()
+    if not expected:
+        return False
+    live = set(live_dns)
+    return any(server not in live for server in expected)
+
+
 class Plugin:
     """Root plugin instance. Decky exposes every async method here as a
     callable from the frontend. Synchronous helpers prefixed with `_` are
@@ -476,6 +565,50 @@ class Plugin:
                 "returncode": -1,
             }
 
+    def _update_settings_fields(self, **fields) -> dict:
+        """Atomically load-set-save isolated settings fields. Safe from
+        worker threads: the whole read-modify-write cycle holds the settings
+        lock, so it can't clobber a concurrent save from the event loop."""
+        with _settings_lock:
+            settings = _load_settings()
+            settings.update(fields)
+            _save_settings(settings)
+            return settings
+
+    def _merge_snapshot(self, field: str, entries: dict):
+        """Record pre-apply system values (sysctl, sysfs) without overwriting
+        entries captured earlier; restores use them so reverting a fix brings
+        back the machine's real prior state (FUNC-06)."""
+        if not entries:
+            return
+        with _settings_lock:
+            settings = _load_settings()
+            snap = dict(settings.get(field) or {})
+            added = {k: v for k, v in entries.items() if k not in snap}
+            if added:
+                snap.update(added)
+                settings[field] = snap
+                _save_settings(settings)
+
+    def _get_connected_bssid(self, iface: str) -> str:
+        """Read the currently associated AP BSSID from `iw dev <iface> link`."""
+        link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+        for line in link_result.get("stdout", "").split("\n"):
+            if "Connected to" in line:
+                parts = line.split()
+                if len(parts) >= 3:
+                    return parts[2]
+                break
+        return ""
+
+    def _txq_off_value(self, settings: dict) -> str:
+        """txqueuelen to restore when tuning/CAKE turn off: the snapshotted
+        pre-plugin value if one exists, else the kernel default."""
+        snap = (settings.get("txqueuelen_snapshot") or "").strip()
+        if snap and snap not in (TXQ_TUNED, TXQ_CAKE):
+            return snap
+        return TXQ_DEFAULT
+
     def _get_wifi_interface(self) -> str | None:
         result = self._run_cmd(
             ["/usr/bin/nmcli", "-t", "-f", "DEVICE,TYPE", "dev", "status"]
@@ -516,6 +649,21 @@ class Plugin:
 
     def _has_backend_tool(self) -> bool:
         return self._get_backend_method() != "none"
+
+    def _backend_unit_available(self, name: str) -> bool:
+        """Check whether a backend's systemd unit exists at all."""
+        for base in (
+            "/usr/lib/systemd/system",
+            "/etc/systemd/system",
+            "/lib/systemd/system",
+        ):
+            if os.path.isfile(os.path.join(base, f"{name}.service")):
+                return True
+        return False
+
+    def _backend_service_active(self, name: str) -> bool:
+        result = self._run_cmd(["/usr/bin/systemctl", "is-active", name], timeout=3)
+        return (result.get("stdout") or "").strip() == "active"
 
     def _get_current_backend(self) -> str | None:
         """Return 'iwd', 'wpa_supplicant', or None if unknown.
@@ -614,12 +762,28 @@ class Plugin:
 
     def _apply_driver_fixes(self, enable: bool):
         """Apply or revert driver-specific power save fixes from DRIVER_PROFILES.
-        Silently no-ops for drivers with no sysfs paths or modprobe options."""
+        Silently no-ops for drivers with no sysfs paths or modprobe options.
+        On apply, current sysfs values are snapshotted so revert restores the
+        machine's real prior state instead of assuming module defaults."""
         settings = _load_settings()
         profile = DRIVER_PROFILES.get(settings.get("driver"), {})
+        snap = settings.get("pcie_snapshot") or {}
 
-        val = "Y" if enable else "N"
+        if enable:
+            entries = {}
+            for path in profile.get("sysfs_power_fixes", []):
+                try:
+                    with open(path, "r") as f:
+                        cur = f.read().strip()
+                    # Don't snapshot our own target value (e.g. the dispatcher
+                    # already applied it) - fall back to module default then.
+                    if cur != "Y":
+                        entries[path] = cur
+                except Exception:
+                    pass
+            self._merge_snapshot("pcie_snapshot", entries)
         for path in profile.get("sysfs_power_fixes", []):
+            val = "Y" if enable else snap.get(path, "N")
             try:
                 with open(path, "w") as f:
                     f.write(val)
@@ -647,7 +811,9 @@ class Plugin:
     def _apply_pcie_aspm_fix(self, enable: bool):
         """Disable or restore PCIe ASPM for the WiFi device.
         Prevents throughput degradation during sustained streaming.
-        Works on all PCIe-attached WiFi adapters."""
+        Works on all PCIe-attached WiFi adapters. Pre-apply values are
+        snapshotted so revert restores what the machine actually had instead
+        of hardcoded defaults (FUNC-06)."""
         try:
             # Discover WiFi PCI device path dynamically
             iface = self._get_wifi_interface()
@@ -657,13 +823,39 @@ class Plugin:
             if not os.path.isdir(device_link):
                 return
 
-            # Disable/restore PCIe ASPM L-states
+            settings = _load_settings()
+            snap = settings.get("pcie_snapshot") or {}
+            aspm_files = ["l0s_aspm", "l1_aspm", "l1_1_aspm", "l1_2_aspm",
+                          "l1_1_pcipm", "l1_2_pcipm"]
             link_dir = os.path.join(device_link, "link")
+            power_control = os.path.join(device_link, "power", "control")
+
+            if enable:
+                entries = {}
+                if os.path.isdir(link_dir):
+                    for aspm_file in aspm_files:
+                        path = os.path.join(link_dir, aspm_file)
+                        try:
+                            with open(path, "r") as f:
+                                cur = f.read().strip()
+                            if cur != "0":
+                                entries[path] = cur
+                        except Exception:
+                            pass
+                try:
+                    with open(power_control, "r") as f:
+                        cur = f.read().strip()
+                    if cur != "on":
+                        entries[power_control] = cur
+                except Exception:
+                    pass
+                self._merge_snapshot("pcie_snapshot", entries)
+
+            # Disable/restore PCIe ASPM L-states
             if os.path.isdir(link_dir):
-                val = "0" if enable else "1"
-                for aspm_file in ["l0s_aspm", "l1_aspm", "l1_1_aspm", "l1_2_aspm",
-                                   "l1_1_pcipm", "l1_2_pcipm"]:
+                for aspm_file in aspm_files:
                     path = os.path.join(link_dir, aspm_file)
+                    val = "0" if enable else snap.get(path, "1")
                     try:
                         with open(path, "w") as f:
                             f.write(val)
@@ -671,16 +863,19 @@ class Plugin:
                         pass
 
             # Disable/restore PCI runtime power management
-            power_control = os.path.join(device_link, "power", "control")
             try:
                 with open(power_control, "w") as f:
-                    f.write("on" if enable else "auto")
+                    f.write("on" if enable else snap.get(power_control, "auto"))
             except (FileNotFoundError, PermissionError):
                 pass
 
             if enable:
                 decky.logger.info(f"PCIe ASPM disabled for {device_link}")
             else:
+                # Snapshot consumed (driver fixes restore before this runs in
+                # _apply_power_save_now); clear it so the next apply captures
+                # the then-current state fresh.
+                self._update_settings_fields(pcie_snapshot={})
                 decky.logger.info(f"PCIe ASPM restored for {device_link}")
         except Exception as e:
             decky.logger.error(f"PCIe ASPM fix error: {e}")
@@ -722,23 +917,50 @@ class Plugin:
         return {"success": True}
 
     def _apply_buffer_tuning_now(self, on: bool, settings: dict | None = None):
-        """Apply tuned or default sysctl values and txqueuelen. Does not persist."""
+        """Apply tuned sysctl values and txqueuelen, or restore the
+        snapshotted pre-apply values (kernel defaults as fallback). Does not
+        persist the feature flag."""
         s = settings if settings is not None else _load_settings()
-        params = SYSCTL_PARAMS if on else SYSCTL_DEFAULTS
+        iface = self._get_wifi_interface()
+        if on:
+            # Snapshot what the system currently runs with, so disabling the
+            # feature restores distro/user tuning instead of assuming kernel
+            # defaults (FUNC-06). Values already at our tuned target are not
+            # snapshotted - they would just re-pin our own values.
+            entries = {}
+            for key, tuned in SYSCTL_PARAMS.items():
+                cur = self._run_cmd(["/usr/bin/sysctl", "-n", key]).get("stdout", "").strip()
+                if cur and cur != tuned:
+                    entries[key] = cur
+            self._merge_snapshot("sysctl_snapshot", entries)
+            if iface and not (_load_settings().get("txqueuelen_snapshot") or "").strip():
+                try:
+                    with open(f"/sys/class/net/{iface}/tx_queue_len", "r") as f:
+                        cur_txq = f.read().strip()
+                    if cur_txq and cur_txq not in (TXQ_TUNED, TXQ_CAKE):
+                        self._update_settings_fields(txqueuelen_snapshot=cur_txq)
+                except Exception:
+                    pass
+            params = dict(SYSCTL_PARAMS)
+        else:
+            snap = _load_settings().get("sysctl_snapshot") or {}
+            params = {k: snap.get(k, SYSCTL_DEFAULTS[k]) for k in SYSCTL_PARAMS}
         for key, value in params.items():
             result = self._run_cmd(["/usr/bin/sysctl", "-w", f"{key}={value}"])
             if not result["success"]:
                 decky.logger.error(f"sysctl {key}={value} failed: {result['stderr']}")
-        iface = self._get_wifi_interface()
         if iface:
             # CAKE manages its own queue; keep txqueuelen at 256 while it is
             # active so the two features don't fight over the value.
             cake_active = s.get("cake_enabled") and self._volatile_gate_open(s)
             if cake_active:
-                txq = "256"
+                txq = TXQ_CAKE
             else:
-                txq = "2000" if on else "1000"
+                txq = TXQ_TUNED if on else self._txq_off_value(_load_settings())
             self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", txq])
+        if not on:
+            # Restored; clear so the next enable snapshots fresh state.
+            self._update_settings_fields(sysctl_snapshot={}, txqueuelen_snapshot="")
 
     def _apply_cake_now(self, on: bool, settings: dict | None = None) -> dict:
         """Install or remove the CAKE qdisc. Does not persist."""
@@ -749,10 +971,9 @@ class Plugin:
         if on:
             modprobe = "/usr/bin/modprobe" if os.path.isfile("/usr/bin/modprobe") else "/usr/sbin/modprobe"
             self._run_cmd([modprobe, "sch_cake"], timeout=5)
-            result = self._run_cmd([
-                "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
-                "cake", "unlimited", "diffserv4", "nat", "ack-filter",
-            ])
+            result = self._run_cmd(
+                ["/usr/bin/tc", "qdisc", "replace", "dev", iface, "root", *CAKE_QDISC_ARGS]
+            )
             if not result["success"]:
                 return {
                     "success": False,
@@ -760,18 +981,19 @@ class Plugin:
                     "message": "Failed to apply CAKE qdisc.",
                     "detail": result.get("stderr", ""),
                 }
-            self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"])
+            self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", TXQ_CAKE])
         else:
             self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
             buffer_active = s.get("buffer_tuning_enabled") and self._volatile_gate_open(s)
-            txq = "2000" if buffer_active else "1000"
+            txq = TXQ_TUNED if buffer_active else self._txq_off_value(s)
             self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", txq])
         return {"success": True}
 
-    async def _apply_streaming_profile(self, active: bool):
+    def _apply_streaming_profile(self, active: bool):
         """Apply (stream started) or revert (stream ended) every volatile fix
         the user has enabled. Called by the watcher on state transitions and
-        by set_streaming_mode when the mode itself is toggled."""
+        by set_streaming_mode when the mode itself is toggled. Blocking
+        (many subprocess calls) - callers run it via asyncio.to_thread."""
         settings = _load_settings()
         if settings.get("buffer_tuning_enabled"):
             self._apply_buffer_tuning_now(active, settings)
@@ -784,15 +1006,7 @@ class Plugin:
         """Scan /proc for a running streaming client. Returns the app label of
         the first match or None. Matches lowercase substrings against each
         process's full command line."""
-        patterns: list[tuple[str, str]] = []
-        apps_enabled = settings.get("streaming_apps", {})
-        for app_id, info in STREAMING_APPS.items():
-            if apps_enabled.get(app_id, True):
-                for p in info["patterns"]:
-                    patterns.append((p, info["label"]))
-        custom = settings.get("streaming_custom_patterns", "") or ""
-        for p in custom.replace(",", " ").split():
-            patterns.append((p.lower(), p))
+        patterns = _build_patterns(settings)
         if not patterns:
             return None
 
@@ -851,7 +1065,7 @@ class Plugin:
                     decky.logger.info(
                         f"Streaming app detected: {detected} - applying fixes"
                     )
-                    await self._apply_streaming_profile(True)
+                    await asyncio.to_thread(self._apply_streaming_profile, True)
                 elif detected != settings.get("streaming_detected_app"):
                     settings["streaming_detected_app"] = detected
                     _save_settings(settings)
@@ -865,7 +1079,7 @@ class Plugin:
                     decky.logger.info(
                         "Streaming app exited - reverting to standard settings"
                     )
-                    await self._apply_streaming_profile(False)
+                    await asyncio.to_thread(self._apply_streaming_profile, False)
             else:
                 self._streaming_misses = 0
 
@@ -1020,9 +1234,21 @@ class Plugin:
             # streaming_active is runtime state; never trust a stale value
             # from before a crash/reboot. The watcher re-detects within one
             # poll interval.
+            stale_streaming_active = settings.get("streaming_active", False)
             settings["streaming_active"] = False
             settings["streaming_detected_app"] = ""
             _save_settings(settings)
+
+            if settings.get("streaming_mode_enabled") and stale_streaming_active:
+                # A crash or hard poweroff mid-stream left streaming_active
+                # behind; if WiFi reconnected before this plugin started, the
+                # dispatcher saw the open gate and applied the volatile fixes.
+                # Revert to stock now - the watcher re-applies within one poll
+                # if a stream really is running (FUNC-05).
+                try:
+                    await asyncio.to_thread(self._apply_streaming_profile, False)
+                except Exception as e:
+                    decky.logger.error(f"Startup streaming revert failed: {e}")
 
             if settings.get("auto_fix_on_wake", True):
                 self._install_dispatcher()
@@ -1096,24 +1322,41 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"_unload error: {e}")
 
+    def _revert_runtime_state(self):
+        """Revert every runtime optimization that is currently enabled,
+        restoring snapshotted pre-plugin values where available. Disabled
+        features are left untouched so we never stomp on distro or user
+        tuning the plugin didn't change (FUNC-06)."""
+        settings = _load_settings()
+        if settings.get("cake_enabled"):
+            self._apply_cake_now(False, settings)
+        if settings.get("buffer_tuning_enabled"):
+            # CAKE is gone at this point; don't let its txqueuelen win.
+            s2 = dict(settings)
+            s2["cake_enabled"] = False
+            self._apply_buffer_tuning_now(False, s2)
+        if settings.get("power_save_disabled"):
+            self._apply_power_save_now(False)
+
+    def _remove_plugin_files(self):
+        """Delete the plugin's own state files (config, settings, runtime)."""
+        for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF, ENFORCED_FILE]:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        settings_dir = os.path.dirname(SETTINGS_FILE)
+        base = os.path.basename(SETTINGS_FILE)
+        for name in [base, base + ".corrupt", base + ".tmp",
+                     DIAGNOSTICS_NAME, LEGACY_ENFORCED_NAME]:
+            _remove_private_file(settings_dir, name)
+
     async def _uninstall(self):
         try:
             decky.logger.info("WiFi Optimizer uninstalling")
             self._remove_dispatcher()
-            self._apply_driver_fixes(False)
-            self._apply_pcie_aspm_fix(False)
-            for key, value in SYSCTL_DEFAULTS.items():
-                self._run_cmd(["/usr/bin/sysctl", "-w", f"{key}={value}"])
-            iface = self._get_wifi_interface()
-            if iface:
-                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
-                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
-            for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF,
-                         SETTINGS_FILE, ENFORCED_FILE]:
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
+            await asyncio.to_thread(self._revert_runtime_state)
+            self._remove_plugin_files()
         except Exception as e:
             decky.logger.error(f"_uninstall error: {e}")
 
@@ -1314,237 +1557,162 @@ class Plugin:
     # ---- Status ----
 
     async def get_status(self) -> dict:
-        # Use shorter timeout for read-only status queries to avoid blocking
-        # the event loop if NM is unresponsive (~10 commands × 2s = 20s worst case)
-        T = 2
-
+        """Status snapshot for the UI. Runs entirely off the event loop: the
+        ~10 subprocess probes would otherwise freeze every IPC call whenever
+        NetworkManager or iw hang - exactly the post-wake situations this
+        plugin exists for (FUNC-02)."""
         try:
-            settings = _load_settings()
-            iface = self._get_wifi_interface()
-            uuid = self._get_active_connection_uuid()
-            connected = iface is not None and uuid is not None
-            support_tier = self._get_support_tier()
-
-            status = {
-                "success": True,
-                "connected": connected,
-                "support_tier": support_tier,
-                "version": decky.DECKY_PLUGIN_VERSION,
-                "settings": settings,
-                "live": {},
-                "drift": {},
-            }
-
-            # Streaming auto mode: expose runtime state and gate drift checks -
-            # with the gate closed, stock settings are the DESIRED state and
-            # must not be reported as drift.
-            gate_open = self._volatile_gate_open(settings)
-            status["live"]["streaming_active"] = settings.get("streaming_active", False)
-            status["live"]["streaming_detected_app"] = settings.get(
-                "streaming_detected_app", ""
-            )
-
-            # Backend info is system-wide; populate regardless of connection state
-            backend_available = self._has_backend_tool()
-            status["live"]["backend_tool_available"] = backend_available
-            if backend_available:
-                status["live"]["wifi_backend"] = self._get_current_backend() or ""
-
-            if not connected:
-                status["live"]["dispatcher_installed"] = os.path.isfile(
-                    DISPATCHER_PATH
-                )
-                return status
-
-            # Remember UUID and ensure high autoconnect-priority so NM
-            # prefers this profile over duplicates on boot (fixes 2.4GHz issue)
-            if uuid and uuid != settings.get("last_connection_uuid"):
-                settings["last_connection_uuid"] = uuid
-                settings["priority_set"] = False
-                _save_settings(settings)
-
-            if uuid and not settings.get("priority_set"):
-                # Bump priority to favor this profile over duplicates on boot.
-                self._nmcli_modify(
-                    uuid, "connection.autoconnect-priority", "100", timeout=T
-                )
-                settings["priority_set"] = True
-                _save_settings(settings)
-
-            # Power save
-            ps_result = self._run_cmd(
-                ["/usr/bin/iw", "dev", iface, "get", "power_save"], timeout=T
-            )
-            ps_off = "Power save: off" in ps_result.get("stdout", "")
-            status["live"]["power_save_off"] = ps_off
-            if settings.get("power_save_disabled") and not ps_off and gate_open:
-                status["drift"]["power_save"] = True
-
-            # Link info
-            link_result = self._run_cmd(
-                ["/usr/bin/iw", "dev", iface, "link"], timeout=T
-            )
-            link_out = link_result.get("stdout", "")
-            for line in link_out.split("\n"):
-                line = line.strip()
-                if line.startswith("signal:"):
-                    status["live"]["signal_dbm"] = line.split(":", 1)[1].strip()
-                elif "tx bitrate:" in line:
-                    status["live"]["tx_bitrate"] = line.split("tx bitrate:", 1)[
-                        1
-                    ].strip()
-                elif line.startswith("freq:"):
-                    status["live"]["frequency"] = line.split(":", 1)[1].strip()
-                elif "Connected to" in line:
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        status["live"]["connected_bssid"] = parts[2]
-
-            # Channel info - parse to "36 (80 MHz)" format
-            info_result = self._run_cmd(
-                ["/usr/bin/iw", "dev", iface, "info"], timeout=T
-            )
-            for line in info_result.get("stdout", "").split("\n"):
-                line = line.strip()
-                if line.startswith("channel"):
-                    # Raw: "channel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz"
-                    parts = line.split(",")
-                    chan_num = ""
-                    width = ""
-                    if parts:
-                        tokens = parts[0].split()
-                        if len(tokens) >= 2:
-                            chan_num = tokens[1]
-                    for part in parts:
-                        part = part.strip()
-                        if part.startswith("width:"):
-                            width = part.split(":", 1)[1].strip()
-                    if chan_num and width:
-                        status["live"]["channel"] = f"{chan_num} ({width})"
-                    elif chan_num:
-                        status["live"]["channel"] = chan_num
-                    else:
-                        status["live"]["channel"] = line
-
-            # BSSID lock
-            bssid_result = self._run_cmd(
-                [
-                    "/usr/bin/nmcli",
-                    "-t",
-                    "-f",
-                    "802-11-wireless.bssid",
-                    "con",
-                    "show",
-                    "uuid",
-                    uuid,
-                ],
-                timeout=T,
-            )
-            bssid_out = bssid_result.get("stdout", "")
-            current_bssid_lock = ""
-            if ":" in bssid_out:
-                # Format: 802-11-wireless.bssid:AA\:BB\:CC\:DD\:EE\:FF
-                parts = bssid_out.split(":", 1)
-                if len(parts) == 2:
-                    current_bssid_lock = parts[1].replace("\\", "").strip()
-            status["live"]["bssid_lock"] = current_bssid_lock
-            if settings.get("bssid_lock_enabled") and not current_bssid_lock:
-                status["drift"]["bssid_lock"] = True
-
-            # IP address
-            ip_result = self._run_cmd(
-                ["/usr/bin/nmcli", "-t", "-f", "IP4.ADDRESS", "dev", "show", iface],
-                timeout=T,
-            )
-            ip_out = ip_result.get("stdout", "")
-            # Format: IP4.ADDRESS[1]:192.168.1.100/24
-            if ":" in ip_out:
-                ip_addr = ip_out.split(":", 1)[1].split("/")[0].strip()
-                status["live"]["ip_address"] = ip_addr
-
-            # DNS
-            dns_result = self._run_cmd(
-                ["/usr/bin/nmcli", "-t", "-f", "IP4.DNS", "dev", "show", iface],
-                timeout=T,
-            )
-            status["live"]["dns"] = dns_result.get("stdout", "")
-
-            # IPv6
-            ipv6_result = self._run_cmd(
-                [
-                    "/usr/bin/nmcli",
-                    "-t",
-                    "-f",
-                    "ipv6.method",
-                    "con",
-                    "show",
-                    "uuid",
-                    uuid,
-                ],
-                timeout=T,
-            )
-            ipv6_out = ipv6_result.get("stdout", "")
-            live_ipv6 = ipv6_out.split(":", 1)[1].strip() if ":" in ipv6_out else ""
-            status["live"]["ipv6_method"] = live_ipv6
-            if settings.get("ipv6_disabled") and live_ipv6 != "disabled":
-                status["drift"]["ipv6"] = True
-                self._nmcli_modify(uuid, "ipv6.method", "disabled", timeout=T)
-
-            # Band preference
-            band_result = self._run_cmd(
-                [
-                    "/usr/bin/nmcli",
-                    "-t",
-                    "-f",
-                    "802-11-wireless.band",
-                    "con",
-                    "show",
-                    "uuid",
-                    uuid,
-                ],
-                timeout=T,
-            )
-            band_out = band_result.get("stdout", "")
-            live_band = band_out.split(":", 1)[1].strip() if ":" in band_out else ""
-            status["live"]["band"] = live_band
-            expected_band = settings.get("band_preference", "a")
-            if settings.get("band_preference_enabled") and live_band != expected_band:
-                status["drift"]["band_preference"] = True
-                self._nmcli_modify(uuid, "802-11-wireless.band", expected_band, timeout=T)
-
-            # Buffer tuning
-            sysctl_result = self._run_cmd(
-                ["/usr/bin/sysctl", "-n", "net.core.rmem_max"], timeout=T
-            )
-            current_rmem = sysctl_result.get("stdout", "").strip()
-            status["live"]["buffer_tuning_applied"] = current_rmem == "16777216"
-            if (
-                settings.get("buffer_tuning_enabled")
-                and current_rmem != "16777216"
-                and gate_open
-            ):
-                status["drift"]["buffer_tuning"] = True
-
-            # CAKE QoS
-            cake_active = self._get_cake_status(iface)
-            status["live"]["cake_applied"] = cake_active
-            if settings.get("cake_enabled") and not cake_active and gate_open:
-                status["drift"]["cake"] = True
-
-            # Dispatcher
-            status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
-
-            # Last enforced by dispatcher
-            try:
-                with open(ENFORCED_FILE, "r") as f:
-                    status["live"]["last_enforced"] = int(f.read().strip())
-            except Exception:
-                status["live"]["last_enforced"] = 0
-
-            return status
+            return await asyncio.to_thread(self._get_status_sync)
         except Exception as e:
             decky.logger.error(f"get_status error: {e}")
             return self._unexpected_response(e)
+
+    def _get_status_sync(self) -> dict:
+        # Shorter timeout for read-only status queries bounds the worst case
+        # when NM is unresponsive (~10 commands x 2s).
+        T = 2
+
+        settings = _load_settings()
+        iface = self._get_wifi_interface()
+        uuid = self._get_active_connection_uuid()
+        connected = iface is not None and uuid is not None
+        support_tier = self._get_support_tier()
+
+        status = {
+            "success": True,
+            "connected": connected,
+            "support_tier": support_tier,
+            "version": decky.DECKY_PLUGIN_VERSION,
+            "settings": settings,
+            "live": {},
+            "drift": {},
+        }
+
+        # Streaming auto mode: expose runtime state and gate drift checks -
+        # with the gate closed, stock settings are the DESIRED state and
+        # must not be reported as drift.
+        gate_open = self._volatile_gate_open(settings)
+        status["live"]["streaming_active"] = settings.get("streaming_active", False)
+        status["live"]["streaming_detected_app"] = settings.get(
+            "streaming_detected_app", ""
+        )
+
+        # Backend info is system-wide; populate regardless of connection state
+        backend_available = self._has_backend_tool()
+        status["live"]["backend_tool_available"] = backend_available
+        if backend_available:
+            status["live"]["wifi_backend"] = self._get_current_backend() or ""
+
+        if not connected:
+            status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
+            return status
+
+        # Remember UUID and ensure high autoconnect-priority so NM prefers
+        # this profile over duplicates on boot (fixes 2.4GHz issue). Writes
+        # go through _update_settings_fields: this code runs in a worker
+        # thread and must not clobber concurrent setter saves.
+        if uuid != settings.get("last_connection_uuid"):
+            settings = self._update_settings_fields(
+                last_connection_uuid=uuid, priority_set=False
+            )
+        if not settings.get("priority_set"):
+            # Bump priority to favor this profile over duplicates on boot.
+            self._nmcli_modify(uuid, "connection.autoconnect-priority", "100", timeout=T)
+            settings = self._update_settings_fields(priority_set=True)
+
+        # Power save
+        ps_result = self._run_cmd(
+            ["/usr/bin/iw", "dev", iface, "get", "power_save"], timeout=T
+        )
+        ps_off = "Power save: off" in ps_result.get("stdout", "")
+        status["live"]["power_save_off"] = ps_off
+        if settings.get("power_save_disabled") and not ps_off and gate_open:
+            status["drift"]["power_save"] = True
+
+        # Link info (signal / bitrate / frequency)
+        link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"], timeout=T)
+        status["live"].update(_parse_iw_link(link_result.get("stdout", "")))
+
+        # Channel info - "36 (80 MHz)"
+        info_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "info"], timeout=T)
+        channel = _parse_iw_channel(info_result.get("stdout", ""))
+        if channel is not None:
+            status["live"]["channel"] = channel
+
+        # Profile fields (BSSID lock, IPv6 method, band) in one nmcli call
+        # instead of three (MAINT-02).
+        con_result = self._run_cmd(
+            [
+                "/usr/bin/nmcli", "-t", "-f",
+                "802-11-wireless.bssid,ipv6.method,802-11-wireless.band",
+                "con", "show", "uuid", uuid,
+            ],
+            timeout=T,
+        )
+        con_fields = _parse_nmcli_fields(con_result.get("stdout", ""))
+        current_bssid_lock = (con_fields.get("802-11-wireless.bssid") or [""])[0]
+        if settings.get("bssid_lock_enabled") and not current_bssid_lock:
+            status["drift"]["bssid_lock"] = True
+
+        # Drift is only reported from here on; fixing it is the job of the
+        # explicit reapply path. A status poll must not mutate system state
+        # (FUNC-01) - the previous auto-heal rewrote the NM profile on disk
+        # every 3s tick for as long as the drift persisted.
+        live_ipv6 = (con_fields.get("ipv6.method") or [""])[0]
+        if settings.get("ipv6_disabled") and live_ipv6 != "disabled":
+            status["drift"]["ipv6"] = True
+
+        live_band = (con_fields.get("802-11-wireless.band") or [""])[0]
+        expected_band = settings.get("band_preference", "a")
+        if settings.get("band_preference_enabled") and live_band != expected_band:
+            status["drift"]["band_preference"] = True
+
+        # Device fields (IP address, DNS) in one nmcli call
+        dev_result = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "IP4.ADDRESS,IP4.DNS", "dev", "show", iface],
+            timeout=T,
+        )
+        dev_fields = _parse_nmcli_fields(dev_result.get("stdout", ""))
+        addresses = dev_fields.get("IP4.ADDRESS") or []
+        if addresses:
+            status["live"]["ip_address"] = addresses[0].split("/")[0].strip()
+
+        if settings.get("dns_enabled") and _dns_drifted(
+            settings.get("dns_servers", ""), dev_fields.get("IP4.DNS") or []
+        ):
+            status["drift"]["dns"] = True
+
+        # Buffer tuning
+        sysctl_result = self._run_cmd(
+            ["/usr/bin/sysctl", "-n", "net.core.rmem_max"], timeout=T
+        )
+        current_rmem = sysctl_result.get("stdout", "").strip()
+        tuned_rmem = SYSCTL_PARAMS["net.core.rmem_max"]
+        status["live"]["buffer_tuning_applied"] = current_rmem == tuned_rmem
+        if (
+            settings.get("buffer_tuning_enabled")
+            and current_rmem != tuned_rmem
+            and gate_open
+        ):
+            status["drift"]["buffer_tuning"] = True
+
+        # CAKE QoS
+        cake_active = self._get_cake_status(iface)
+        status["live"]["cake_applied"] = cake_active
+        if settings.get("cake_enabled") and not cake_active and gate_open:
+            status["drift"]["cake"] = True
+
+        # Dispatcher
+        status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
+
+        # Last enforced by dispatcher
+        try:
+            with open(ENFORCED_FILE, "r") as f:
+                status["live"]["last_enforced"] = int(f.read().strip())
+        except Exception:
+            status["live"]["last_enforced"] = 0
+
+        return status
 
     # ---- Optimization setters ----
 
@@ -1557,7 +1725,7 @@ class Plugin:
             # Disabling always reverts the runtime state immediately.
             effective = disabled and self._volatile_gate_open(settings)
 
-            result = self._apply_power_save_now(effective)
+            result = await asyncio.to_thread(self._apply_power_save_now, effective)
             if not result["success"]:
                 return result
 
@@ -1614,15 +1782,7 @@ class Plugin:
                 if err:
                     return err
 
-                link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
-                link_out = link_result.get("stdout", "")
-                bssid = ""
-                for line in link_out.split("\n"):
-                    if "Connected to" in line:
-                        parts = line.split()
-                        if len(parts) >= 3:
-                            bssid = parts[2]
-                        break
+                bssid = await asyncio.to_thread(self._get_connected_bssid, iface)
 
                 if not bssid:
                     return {
@@ -1645,7 +1805,7 @@ class Plugin:
                 settings["bssid_lock_value"] = bssid
                 settings["bssid_lock_connection_uuid"] = uuid
                 _save_settings_with_timestamp(settings)
-                self._hard_reconnect(uuid)
+                await asyncio.to_thread(self._hard_reconnect, uuid)
             else:
                 # Disabling works on saved profiles - no active WiFi needed
                 iface, uuid, _ = self._require_wifi()
@@ -1672,7 +1832,7 @@ class Plugin:
                 settings["bssid_lock_value"] = ""
                 settings["bssid_lock_connection_uuid"] = ""
                 _save_settings_with_timestamp(settings)
-                self._hard_reconnect(uuid)
+                await asyncio.to_thread(self._hard_reconnect, uuid)
 
             return {"success": True, "bssid_locked": enabled, "reconnected": True}
         except Exception as e:
@@ -1716,25 +1876,31 @@ class Plugin:
             settings["band_preference"] = band
             _save_settings_with_timestamp(settings)
 
-            self._hard_reconnect(uuid)
+            await asyncio.to_thread(self._hard_reconnect, uuid)
 
             # Re-lock BSSID to whatever AP NM picked on the new band
             if enabled and had_bssid_lock:
-                time.sleep(3)
-                iface = self._get_wifi_interface()
-                if iface:
-                    link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
-                    for line in link_result.get("stdout", "").split("\n"):
-                        if "Connected to" in line:
-                            parts = line.split()
-                            if len(parts) >= 3:
-                                new_bssid = parts[2]
-                                self._nmcli_modify(uuid, "802-11-wireless.bssid", new_bssid)
-                                settings = _load_settings()
-                                settings["bssid_lock_value"] = new_bssid
-                                _save_settings(settings)
-                                decky.logger.info(f"Re-locked BSSID to {new_bssid} after band change")
-                            break
+                # await, not time.sleep: a blocking sleep would freeze every
+                # IPC call for 3s (FUNC-02).
+                await asyncio.sleep(3)
+
+                def _relock() -> str:
+                    iface = self._get_wifi_interface()
+                    if not iface:
+                        return ""
+                    new_bssid = self._get_connected_bssid(iface)
+                    if new_bssid:
+                        self._nmcli_modify(uuid, "802-11-wireless.bssid", new_bssid)
+                    return new_bssid
+
+                new_bssid = await asyncio.to_thread(_relock)
+                if new_bssid:
+                    # Reload after the awaits - another writer may have
+                    # saved settings in the meantime.
+                    settings = _load_settings()
+                    settings["bssid_lock_value"] = new_bssid
+                    _save_settings(settings)
+                    decky.logger.info(f"Re-locked BSSID to {new_bssid} after band change")
 
             return {"success": True, "band": value, "reconnected": True}
         except Exception as e:
@@ -1788,8 +1954,25 @@ class Plugin:
                         "detail": result2["stderr"],
                     }
             else:
-                self._nmcli_modify(uuid, "ipv4.dns", "")
-                self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no")
+                # Check results like the enable path does - a failed revert
+                # would otherwise leave the override active while the UI
+                # says DNS is off (FUNC-08).
+                result = self._nmcli_modify(uuid, "ipv4.dns", "")
+                if not result["success"]:
+                    return {
+                        "success": False,
+                        "error": "nmcli_failed",
+                        "message": "Couldn't clear DNS override",
+                        "detail": result["stderr"],
+                    }
+                result2 = self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no")
+                if not result2["success"]:
+                    return {
+                        "success": False,
+                        "error": "nmcli_failed",
+                        "message": "Couldn't restore automatic DNS",
+                        "detail": result2["stderr"],
+                    }
                 servers = ""
 
             settings = _load_settings()
@@ -1798,7 +1981,7 @@ class Plugin:
             settings["dns_servers"] = servers
             _save_settings_with_timestamp(settings)
 
-            self._hard_reconnect(uuid)
+            await asyncio.to_thread(self._hard_reconnect, uuid)
             return {"success": True, "dns_set": enabled, "reconnected": True}
         except Exception as e:
             decky.logger.error(f"set_dns error: {e}")
@@ -1827,7 +2010,7 @@ class Plugin:
             settings["ipv6_disabled"] = disabled
             _save_settings_with_timestamp(settings)
 
-            self._hard_reconnect(uuid)
+            await asyncio.to_thread(self._hard_reconnect, uuid)
             return {"success": True, "ipv6_disabled": disabled, "reconnected": True}
         except Exception as e:
             decky.logger.error(f"set_ipv6 error: {e}")
@@ -1839,8 +2022,11 @@ class Plugin:
             # In streaming auto mode with no stream running, only record
             # intent; the watcher applies the tuning on detection.
             effective = enabled and self._volatile_gate_open(settings)
-            self._apply_buffer_tuning_now(effective, settings)
+            await asyncio.to_thread(self._apply_buffer_tuning_now, effective, settings)
 
+            # Reload after the await: the applier snapshots values and other
+            # writers may have saved; mutating the stale copy would undo that.
+            settings = _load_settings()
             settings["buffer_tuning_enabled"] = enabled
             _save_settings_with_timestamp(settings)
             return {"success": True, "buffer_tuning": enabled}
@@ -1868,7 +2054,7 @@ class Plugin:
             # In streaming auto mode with no stream running, only record
             # intent; the watcher installs the qdisc on detection.
             effective = enabled and self._volatile_gate_open(settings)
-            result = self._apply_cake_now(effective, settings)
+            result = await asyncio.to_thread(self._apply_cake_now, effective, settings)
             if enabled and effective and not result["success"]:
                 return result
             decky.logger.info(
@@ -1907,7 +2093,7 @@ class Plugin:
                     os.remove(NM_CONF_PATH)
                 except FileNotFoundError:
                     pass
-                await self._apply_streaming_profile(bool(detected))
+                await asyncio.to_thread(self._apply_streaming_profile, bool(detected))
                 decky.logger.info(
                     f"Streaming auto mode enabled (detected: {detected or 'none'})"
                 )
@@ -1921,7 +2107,7 @@ class Plugin:
                     os.makedirs(os.path.dirname(NM_CONF_PATH), exist_ok=True)
                     with open(NM_CONF_PATH, "w") as f:
                         f.write("[connection]\nwifi.powersave = 2\n")
-                await self._apply_streaming_profile(True)
+                await asyncio.to_thread(self._apply_streaming_profile, True)
                 decky.logger.info("Streaming auto mode disabled - global toggles active")
 
             settings = _load_settings()
@@ -1958,10 +2144,25 @@ class Plugin:
             return self._unexpected_response(e)
 
     async def set_streaming_custom_patterns(self, patterns: str) -> dict:
-        """Store user-defined process patterns (space/comma separated)."""
+        """Store user-defined process patterns (space/comma separated).
+        Rejects tokens shorter than MIN_PATTERN_LEN - "a" would match half
+        of /proc and silently pin the streaming gate open (FUNC-11)."""
         try:
+            cleaned = (patterns or "").strip()
+            too_short = [
+                t for t in cleaned.replace(",", " ").split() if len(t) < MIN_PATTERN_LEN
+            ]
+            if too_short:
+                return {
+                    "success": False,
+                    "error": "invalid_pattern",
+                    "message": (
+                        f"Patterns need at least {MIN_PATTERN_LEN} characters: "
+                        + ", ".join(too_short)
+                    ),
+                }
             settings = _load_settings()
-            settings["streaming_custom_patterns"] = (patterns or "").strip()
+            settings["streaming_custom_patterns"] = cleaned
             _save_settings(settings)
             await self._run_detection_pass(settle_immediately=True)
             return {"success": True, "patterns": settings["streaming_custom_patterns"]}
@@ -2167,41 +2368,16 @@ class Plugin:
     async def reset_settings(self) -> dict:
         """Delete settings and revert to defaults."""
         try:
-            # Revert runtime state
-            self._apply_driver_fixes(False)
-            self._apply_pcie_aspm_fix(False)
-            for key, value in SYSCTL_DEFAULTS.items():
-                self._run_cmd(["/usr/bin/sysctl", "-w", f"{key}={value}"])
-            iface = self._get_wifi_interface()
-            if iface:
-                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
-                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
-            try:
-                os.remove(NM_CONF_PATH)
-            except FileNotFoundError:
-                pass
-            try:
-                os.remove(MODPROBE_CONF_PATH)
-            except FileNotFoundError:
-                pass
-            try:
-                os.remove(SETTINGS_FILE)
-            except FileNotFoundError:
-                pass
-            try:
-                os.remove(ENFORCED_FILE)
-            except FileNotFoundError:
-                pass
-            try:
-                os.remove(GENERIC_BACKEND_CONF)
-            except FileNotFoundError:
-                pass
+            await asyncio.to_thread(self._revert_runtime_state)
+            self._remove_plugin_files()
 
             # Repopulate model/driver so the plugin doesn't show as "UNKNOWN /
             # Unsupported device" until the next plugin reload. Mirrors the
-            # hardware detection _main does on startup.
+            # hardware detection _main does on startup. deepcopy: a shallow
+            # copy would share the nested streaming_apps dict with the module
+            # constant (FUNC-09).
             info = await self.get_device_info()
-            fresh = dict(DEFAULT_SETTINGS)
+            fresh = copy.deepcopy(DEFAULT_SETTINGS)
             fresh["model"] = info.get("model", "unknown")
             fresh["driver"] = info.get("driver", "unknown")
             fresh["device_family"] = info.get("device_family", "unknown")
@@ -2588,8 +2764,12 @@ systemctl restart plugin_loader 2>/dev/null || true
                     elapsed += 1
                 reconnect_timed_out = not reconnected
 
-            # Verify final system state
+            # Verify final state. _get_current_backend reads the conf the
+            # helper just wrote, so alone it would only confirm our own write
+            # (FUNC-04); additionally require the target service to actually
+            # run, or WiFi to have come back, before calling this a success.
             final_backend = await asyncio.to_thread(self._get_current_backend)
+            service_active = await asyncio.to_thread(self._backend_service_active, target)
 
             if needs_reboot:
                 self._backend_switch["phase"] = "failed"
@@ -2601,8 +2781,14 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "needs_reboot": True,
                     "message": "Backend switched but wlan0 didn't come back. Reboot required.",
                 }
-            elif not restart_result["success"] or final_backend != target:
+            elif (
+                not restart_result["success"]
+                or final_backend != target
+                or (reconnect_timed_out and not service_active)
+            ):
                 detail = rs_stderr[:200] or rs_stdout[:200]
+                if not detail and reconnect_timed_out and not service_active:
+                    detail = f"{target} service is not running"
                 self._backend_switch["phase"] = "failed"
                 self._backend_switch["result"] = {
                     "success": False,
@@ -2654,6 +2840,18 @@ systemctl restart plugin_loader 2>/dev/null || true
         try:
             other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
 
+            # Fail fast if the target service doesn't exist on this distro -
+            # otherwise we'd write the NM config, kill the working backend,
+            # and only find out afterwards (FUNC-04).
+            if not await asyncio.to_thread(self._backend_unit_available, target):
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "target": target,
+                    "message": f"The {target} service is not installed on this system.",
+                }
+                return
+
             self._backend_switch["phase"] = "switching"
             decky.logger.info(f"generic backend switch: {other} -> {target}")
 
@@ -2703,9 +2901,13 @@ systemctl restart plugin_loader 2>/dev/null || true
                         reconnect_timed_out = False
                         break
 
+            # _get_current_backend reads the conf we just wrote; require the
+            # target service to actually run (or WiFi to be back) before
+            # reporting success (FUNC-04).
             final_backend = await asyncio.to_thread(self._get_current_backend)
+            service_active = await asyncio.to_thread(self._backend_service_active, target)
 
-            if final_backend == target:
+            if final_backend == target and (service_active or not reconnect_timed_out):
                 self._backend_switch["phase"] = "done"
                 self._backend_switch["result"] = {
                     "success": True,
@@ -2716,6 +2918,13 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "reconnect_timed_out": reconnect_timed_out,
                 }
             else:
+                if final_backend != target:
+                    msg = f"Expected {target} but got {final_backend}. A reboot may help."
+                else:
+                    msg = (
+                        f"Config switched to {target} but its service isn't running. "
+                        "A reboot may help."
+                    )
                 self._backend_switch["phase"] = "failed"
                 self._backend_switch["result"] = {
                     "success": False,
@@ -2724,7 +2933,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "recovery_performed": False,
                     "needs_reboot": False,
                     "reconnect_timed_out": reconnect_timed_out,
-                    "message": f"Expected {target} but got {final_backend}. A reboot may help.",
+                    "message": msg,
                 }
 
             decky.logger.info(
