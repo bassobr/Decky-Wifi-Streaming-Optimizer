@@ -1,10 +1,11 @@
 #!/bin/bash
-# WiFi Optimizer - Decky Plugin Installer
+# WiFi Optimizer Streaming - Decky Plugin Installer
 # Usage: curl -sL https://github.com/bassobr/Decky-Wifi-Streaming-Optimizer/raw/main/install.sh -o /tmp/wifi-opt-streaming-install.sh && sudo bash /tmp/wifi-opt-streaming-install.sh
 
 set -e
 
 PLUGIN_NAME="WiFi Optimizer Streaming"
+REPO="bassobr/Decky-Wifi-Streaming-Optimizer"
 
 # Check for root (needed to write to plugin dir and restart service)
 if [ "$(id -u)" -ne 0 ]; then
@@ -30,20 +31,6 @@ if [ ! -d "$PLUGIN_BASE" ]; then
     exit 1
 fi
 
-# Fetch latest release tag from GitHub
-echo "Checking for latest release..."
-LATEST_TAG=$(curl -sL "https://api.github.com/repos/bassobr/Decky-Wifi-Streaming-Optimizer/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
-
-if [ -z "$LATEST_TAG" ]; then
-    echo "Warning: Couldn't fetch latest release, falling back to main branch"
-    REPO_URL="https://github.com/bassobr/Decky-Wifi-Streaming-Optimizer/archive/refs/heads/main.tar.gz"
-    DIR_NAME="Decky-Wifi-Streaming-Optimizer-main"
-else
-    echo "Latest release: $LATEST_TAG"
-    REPO_URL="https://github.com/bassobr/Decky-Wifi-Streaming-Optimizer/archive/refs/tags/${LATEST_TAG}.tar.gz"
-    DIR_NAME="Decky-Wifi-Streaming-Optimizer-${LATEST_TAG#v}"
-fi
-
 TMP_DIR=$(mktemp -d)
 
 cleanup() {
@@ -51,18 +38,72 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Installing $PLUGIN_NAME..."
+extract_zip() {
+    # SteamOS/Bazzite don't reliably ship unzip; bsdtar or python3 do the job.
+    if command -v bsdtar >/dev/null 2>&1; then
+        bsdtar -xf "$1" -C "$2"
+    else
+        python3 - "$1" "$2" <<'PYEOF'
+import sys, zipfile
+zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])
+PYEOF
+    fi
+}
 
-# Download and extract
-echo "Downloading..."
-curl -sL "$REPO_URL" -o "$TMP_DIR/plugin.tar.gz"
-tar xzf "$TMP_DIR/plugin.tar.gz" -C "$TMP_DIR"
+# Fetch latest release tag from GitHub
+echo "Checking for latest release..."
+RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+LATEST_TAG=$(printf '%s' "$RELEASE_JSON" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
 
-SRC="$TMP_DIR/$DIR_NAME"
+SRC=""
+if [ -n "$LATEST_TAG" ]; then
+    echo "Latest release: $LATEST_TAG"
+    VERSION="${LATEST_TAG#v}"
+    ZIP_NAME="wifi-optimizer-streaming-${VERSION}.zip"
+    ASSET_BASE="https://github.com/$REPO/releases/download/${LATEST_TAG}"
+
+    # Preferred path: the CI-built release zip, verified against the
+    # release's SHA256SUMS. The source tarball below is only a fallback.
+    if curl -fsSL -o "$TMP_DIR/$ZIP_NAME" "$ASSET_BASE/$ZIP_NAME" 2>/dev/null; then
+        echo "Downloaded release build."
+        if curl -fsSL -o "$TMP_DIR/SHA256SUMS" "$ASSET_BASE/SHA256SUMS" 2>/dev/null; then
+            echo "Verifying checksum..."
+            if ! (cd "$TMP_DIR" && sha256sum --check --ignore-missing SHA256SUMS); then
+                echo "Error: checksum verification failed - aborting."
+                exit 1
+            fi
+        else
+            echo "Warning: no SHA256SUMS published for $LATEST_TAG - installing unverified."
+        fi
+        mkdir -p "$TMP_DIR/zip"
+        extract_zip "$TMP_DIR/$ZIP_NAME" "$TMP_DIR/zip"
+        SRC="$TMP_DIR/zip/$PLUGIN_NAME"
+    else
+        echo "Warning: release build asset missing, falling back to source tarball (unverified)."
+    fi
+fi
+
+if [ -z "$SRC" ] || [ ! -f "$SRC/plugin.json" ]; then
+    if [ -n "$LATEST_TAG" ]; then
+        REPO_URL="https://github.com/$REPO/archive/refs/tags/${LATEST_TAG}.tar.gz"
+        DIR_NAME="Decky-Wifi-Streaming-Optimizer-${LATEST_TAG#v}"
+    else
+        echo "Warning: couldn't fetch latest release, falling back to main branch (unverified)"
+        REPO_URL="https://github.com/$REPO/archive/refs/heads/main.tar.gz"
+        DIR_NAME="Decky-Wifi-Streaming-Optimizer-main"
+    fi
+    echo "Downloading..."
+    curl -fsSL "$REPO_URL" -o "$TMP_DIR/plugin.tar.gz"
+    tar xzf "$TMP_DIR/plugin.tar.gz" -C "$TMP_DIR"
+    SRC="$TMP_DIR/$DIR_NAME"
+fi
+
 if [ ! -f "$SRC/plugin.json" ]; then
     echo "Error: Download failed or repo structure changed."
     exit 1
 fi
+
+echo "Installing $PLUGIN_NAME..."
 
 # Install
 if [ -d "$PLUGIN_DIR" ]; then
@@ -90,7 +131,7 @@ systemctl restart plugin_loader 2>/dev/null || true
 
 echo ""
 if [ "$UPGRADING" = true ]; then
-    echo "WiFi Optimizer updated! Your settings have been preserved."
+    echo "WiFi Optimizer Streaming updated! Your settings have been preserved."
 else
-    echo "WiFi Optimizer installed! Open the Quick Access Menu to configure."
+    echo "WiFi Optimizer Streaming installed! Open the Quick Access Menu to configure."
 fi

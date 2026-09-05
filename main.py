@@ -9,10 +9,17 @@ QoS) on every WiFi reconnect independently of Decky.
 """
 
 import os
+import re
 import copy
 import json
 import time
+import shutil
 import asyncio
+import hashlib
+import tarfile
+import zipfile
+import tempfile
+import threading
 import subprocess
 
 try:
@@ -99,12 +106,19 @@ DMI_SUBSTRING_DEVICES = [
     ("ROG Ally RC71L", {"family": "rog_ally", "label": "ROG Ally"}),
 ]
 
+# last_enforced lives under /run (root-owned tmpfs): the dispatcher runs as
+# root and must never write through paths an unprivileged user could swap for
+# a symlink, which the user-writable settings dir would allow (SEC-01). The
+# legacy copy inside the settings dir is removed on startup.
+ENFORCED_DIR = "/run/wifi-optimizer"
+ENFORCED_FILE = os.path.join(ENFORCED_DIR, "last_enforced")
+LEGACY_ENFORCED_NAME = "last_enforced"
+DIAGNOSTICS_NAME = "diagnostics.json"
+
 try:
     SETTINGS_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
-    ENFORCED_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "last_enforced")
 except Exception:
     SETTINGS_FILE = "/tmp/wifi-optimizer/settings.json"
-    ENFORCED_FILE = "/tmp/wifi-optimizer/last_enforced"
 
 DNS_PROVIDERS = {
     "cloudflare": "1.1.1.1 1.0.0.1",
@@ -153,7 +167,7 @@ SYSCTL_PARAMS = {
     "net.ipv4.tcp_slow_start_after_idle": "0",
 }
 
-# Kernel defaults, restored when buffer tuning is disabled.
+# Kernel defaults, used as fallback when no pre-apply snapshot exists.
 SYSCTL_DEFAULTS = {
     "net.core.rmem_max": "212992",
     "net.core.wmem_max": "212992",
@@ -164,6 +178,24 @@ SYSCTL_DEFAULTS = {
     "net.core.netdev_budget_usecs": "2000",
     "net.ipv4.tcp_slow_start_after_idle": "1",
 }
+
+# txqueuelen values and the CAKE qdisc arguments are shared between the
+# Python appliers and the rendered dispatcher script (single source of
+# truth - see _render_dispatcher_script).
+TXQ_TUNED = "2000"
+TXQ_DEFAULT = "1000"
+TXQ_CAKE = "256"
+CAKE_QDISC_ARGS = ["cake", "unlimited", "diffserv4", "nat", "ack-filter"]
+
+# Custom streaming patterns shorter than this match half of every process
+# list ("a" matches almost anything) and would silently pin the streaming
+# gate open, so they are rejected on save and skipped on scan.
+MIN_PATTERN_LEN = 3
+
+# Version strings arriving from the GitHub API are embedded in download URLs
+# and exported to a root shell via the environment; allow plain version
+# characters only.
+VERSION_RE = re.compile(r"^[0-9A-Za-z._-]{1,64}$")
 
 DEFAULT_SETTINGS = {
     "model": "unknown",
@@ -206,15 +238,93 @@ DEFAULT_SETTINGS = {
 # they mutate the result before saving, which must never leak into the cache.
 _settings_cache: dict = {"stat": None, "data": None}
 
+# Settings are now also read/written from worker threads (get_status and the
+# volatile-fix appliers run in asyncio.to_thread); the RLock keeps cache and
+# file writes coherent across threads. Read-modify-write cycles that must be
+# atomic go through Plugin._update_settings_fields, which holds the lock for
+# the whole cycle.
+_settings_lock = threading.RLock()
+_last_settings_error_log = 0.0
+
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
+
+def _open_private_dir(directory: str) -> int:
+    """Open a directory fd, refusing symlinks. All root-owned file operations
+    inside user-writable directories go through this fd so a user swapping
+    the directory (or planting symlinks) between check and use cannot
+    redirect root's writes elsewhere (SEC-01)."""
+    return os.open(directory, os.O_RDONLY | _O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _write_private_file(directory: str, name: str, content: str):
+    """Symlink-safe write of a root-created file into a possibly
+    user-writable directory: never follow symlinks, never reuse a
+    pre-created file (SEC-01)."""
+    dfd = _open_private_dir(directory)
+    try:
+        try:
+            os.remove(name, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd
+        )
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+    finally:
+        os.close(dfd)
+
+
+def _remove_private_file(directory: str, name: str):
+    """Symlink-safe removal of a file inside a possibly user-writable dir."""
+    try:
+        dfd = _open_private_dir(directory)
+    except OSError:
+        return
+    try:
+        try:
+            os.remove(name, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(dfd)
+
 
 def _load_settings() -> dict:
-    try:
-        st = os.stat(SETTINGS_FILE)
-        cache_key = (st.st_mtime_ns, st.st_size)
-        if _settings_cache["stat"] == cache_key and _settings_cache["data"] is not None:
-            return copy.deepcopy(_settings_cache["data"])
-        with open(SETTINGS_FILE, "r") as f:
-            data = json.load(f)
+    global _last_settings_error_log
+    with _settings_lock:
+        try:
+            st = os.stat(SETTINGS_FILE)
+            cache_key = (st.st_mtime_ns, st.st_size)
+            if _settings_cache["stat"] == cache_key and _settings_cache["data"] is not None:
+                return copy.deepcopy(_settings_cache["data"])
+            with open(SETTINGS_FILE, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("settings root is not a JSON object")
+        except FileNotFoundError:
+            return copy.deepcopy(DEFAULT_SETTINGS)
+        except (json.JSONDecodeError, ValueError) as e:
+            # A corrupt file would otherwise be silently replaced with
+            # defaults on the next save - keep the evidence and log it
+            # instead of losing the user's settings without a trace.
+            decky.logger.error(
+                f"settings.json is corrupt ({e}); backing up to settings.json.corrupt"
+            )
+            try:
+                os.replace(SETTINGS_FILE, SETTINGS_FILE + ".corrupt")
+            except Exception:
+                pass
+            return copy.deepcopy(DEFAULT_SETTINGS)
+        except Exception as e:
+            # Rate-limited: a persistent read failure (e.g. permissions)
+            # would otherwise log on every 3s status poll.
+            now = time.monotonic()
+            if now - _last_settings_error_log > 300:
+                _last_settings_error_log = now
+                decky.logger.error(f"Failed to read settings: {e}")
+            return copy.deepcopy(DEFAULT_SETTINGS)
         # Merge with defaults (adds new keys), then strip stale keys
         merged = {**DEFAULT_SETTINGS, **data}
         # streaming_apps merges per-app so newly added presets default to
@@ -227,30 +337,93 @@ def _load_settings() -> dict:
         _settings_cache["stat"] = cache_key
         _settings_cache["data"] = copy.deepcopy(result)
         return result
-    except Exception:
-        return copy.deepcopy(DEFAULT_SETTINGS)
 
 
 def _save_settings(data: dict):
-    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
-    # Atomic write: write to temp file then rename to prevent corruption on crash
-    tmp_path = SETTINGS_FILE + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_path, SETTINGS_FILE)
-    try:
-        st = os.stat(SETTINGS_FILE)
-        _settings_cache["stat"] = (st.st_mtime_ns, st.st_size)
-        _settings_cache["data"] = copy.deepcopy(data)
-    except Exception:
-        _settings_cache["stat"] = None
-        _settings_cache["data"] = None
+    settings_dir = os.path.dirname(SETTINGS_FILE)
+    base = os.path.basename(SETTINGS_FILE)
+    tmp_name = base + ".tmp"
+    with _settings_lock:
+        os.makedirs(settings_dir, exist_ok=True)
+        # Atomic write (tmp + rename), pinned to the real directory via
+        # dir_fd and with O_EXCL|O_NOFOLLOW so a pre-created file or symlink
+        # in the user-writable settings dir is refused instead of followed
+        # by this root process (SEC-01).
+        dfd = _open_private_dir(settings_dir)
+        try:
+            try:
+                os.remove(tmp_name, dir_fd=dfd)
+            except FileNotFoundError:
+                pass
+            fd = os.open(
+                tmp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o644,
+                dir_fd=dfd,
+            )
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_name, base, src_dir_fd=dfd, dst_dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        try:
+            st = os.stat(SETTINGS_FILE)
+            _settings_cache["stat"] = (st.st_mtime_ns, st.st_size)
+            _settings_cache["data"] = copy.deepcopy(data)
+        except Exception:
+            _settings_cache["stat"] = None
+            _settings_cache["data"] = None
 
 
 def _save_settings_with_timestamp(data: dict):
     """Save settings and update last_applied timestamp in one write."""
     data["last_applied"] = int(time.time())
     _save_settings(data)
+
+
+def _verify_sha256(sums_text: str, filename: str, path: str) -> tuple[bool, str]:
+    """Check `path` against the entry for `filename` in a sha256sum-format
+    SHA256SUMS document. Returns (ok, detail)."""
+    expected = None
+    for line in sums_text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1].lstrip("*") == filename:
+            expected = parts[0].lower()
+            break
+    if not expected:
+        return False, f"no entry for {filename} in SHA256SUMS"
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    actual = h.hexdigest()
+    if actual != expected:
+        return False, f"sha256 mismatch: expected {expected}, got {actual}"
+    return True, ""
+
+
+def _safe_extract_zip(zip_path: str, dest: str):
+    """Extract a zip, rejecting members that would escape dest."""
+    with zipfile.ZipFile(zip_path) as z:
+        for name in z.namelist():
+            p = os.path.normpath(name)
+            if p.startswith("..") or os.path.isabs(p):
+                raise ValueError(f"unsafe zip member: {name}")
+        z.extractall(dest)
+
+
+def _safe_extract_tar(tar_path: str, dest: str):
+    """Extract a .tar.gz, rejecting traversal, links, and absolute paths."""
+    with tarfile.open(tar_path, "r:gz") as t:
+        try:
+            t.extractall(dest, filter="data")
+        except TypeError:
+            # Python without extraction-filter support: validate manually.
+            for m in t.getmembers():
+                name = os.path.normpath(m.name)
+                if name.startswith("..") or os.path.isabs(name) or m.islnk() or m.issym():
+                    raise ValueError(f"unsafe tar member: {m.name}")
+            t.extractall(dest)
 
 
 class Plugin:
@@ -730,15 +903,48 @@ class Plugin:
             decky.logger.error(f"poke_detection error: {e}")
             return self._unexpected_response(e)
 
+    def _render_dispatcher_script(self, template: str) -> str:
+        """Render the dispatcher template. All tuning values (sysctl set,
+        driver sysfs fixes, CAKE args, txqueuelen) are injected from the
+        constants in this module so the plugin and the dispatcher can never
+        disagree about what gets applied."""
+        sysctl_lines = "\n".join(
+            f"    /usr/bin/sysctl -w {k}={v} >/dev/null 2>&1"
+            for k, v in SYSCTL_PARAMS.items()
+        )
+        driver_blocks = []
+        for name, profile in DRIVER_PROFILES.items():
+            fixes = profile.get("sysfs_power_fixes", [])
+            if not fixes:
+                continue
+            lines = [f'    if [ "$DRIVER" = "{name}" ]; then']
+            lines += [f"        echo Y > {path} 2>/dev/null" for path in fixes]
+            lines.append("    fi")
+            driver_blocks.append("\n".join(lines))
+        replacements = {
+            "__SETTINGS_PATH__": SETTINGS_FILE,
+            "__PLUGIN_DIR__": decky.DECKY_PLUGIN_DIR,
+            "__ENFORCED_DIR__": ENFORCED_DIR,
+            "__SYSCTL_CMDS__": sysctl_lines,
+            "__DRIVER_FIXES__": "\n".join(driver_blocks) if driver_blocks else "    :",
+            "__CAKE_ARGS__": " ".join(CAKE_QDISC_ARGS),
+            "__TXQ_TUNED__": TXQ_TUNED,
+            "__TXQ_CAKE__": TXQ_CAKE,
+        }
+        script = template
+        for placeholder, value in replacements.items():
+            script = script.replace(placeholder, value)
+        return script
+
     def _install_dispatcher(self):
         try:
             template_path = os.path.join(
                 decky.DECKY_PLUGIN_DIR, "defaults", "dispatcher.sh.tmpl"
             )
             with open(template_path, "r") as f:
-                script = f.read()
-            script = script.replace("__SETTINGS_PATH__", SETTINGS_FILE)
-            script = script.replace("__PLUGIN_DIR__", decky.DECKY_PLUGIN_DIR)
+                template = f.read()
+            script = self._render_dispatcher_script(template)
+            # /etc/NetworkManager/dispatcher.d is root-owned; plain write is fine.
             with open(DISPATCHER_PATH, "w") as f:
                 f.write(script)
             os.chmod(DISPATCHER_PATH, 0o755)
@@ -796,6 +1002,9 @@ class Plugin:
         try:
             decky.logger.info("WiFi Optimizer starting")
             self._rotate_logs()
+            # last_enforced moved to root-owned /run (SEC-01); drop the legacy
+            # copy from the user-writable settings dir.
+            _remove_private_file(os.path.dirname(SETTINGS_FILE), LEGACY_ENFORCED_NAME)
             self._ensure_backend_switch_state()
             info = await self.get_device_info()
             settings = _load_settings()
@@ -1089,15 +1298,15 @@ class Plugin:
 
     async def save_diagnostic_info(self) -> dict:
         """Write diagnostics to a file in the settings directory as a
-        fallback when clipboard is unavailable."""
+        fallback when clipboard is unavailable. Note: the report includes
+        network identifiers (SSID, interface MAC, AP BSSID)."""
         try:
             info = await self.get_diagnostic_info()
-            diag_path = os.path.join(
-                os.path.dirname(SETTINGS_FILE), "diagnostics.json"
+            settings_dir = os.path.dirname(SETTINGS_FILE)
+            _write_private_file(
+                settings_dir, DIAGNOSTICS_NAME, json.dumps(info, indent=2)
             )
-            with open(diag_path, "w") as f:
-                json.dump(info, f, indent=2)
-            return {"success": True, "path": diag_path}
+            return {"success": True, "path": os.path.join(settings_dir, DIAGNOSTICS_NAME)}
         except Exception as e:
             decky.logger.error(f"save_diagnostic_info error: {e}")
             return {"success": False, "error": str(e)}
@@ -2130,77 +2339,172 @@ class Plugin:
                 "message": str(e),
             }
 
+    def _download_file(self, url: str, dest: str, timeout: int = 60) -> dict:
+        """Download url to dest with curl. -f makes HTTP errors fail the
+        command instead of saving an error page."""
+        return self._run_cmd(
+            [
+                "/usr/bin/curl", "-fsSL", "--connect-timeout", "5",
+                "--max-time", str(timeout), "-o", dest, url,
+            ],
+            timeout=timeout + 5,
+            clean_env=True,
+        )
+
+    # The detached hand-off script is fixed text: every variable it needs
+    # (paths, label) arrives via the environment, never via interpolation
+    # into shell code, and it reaches bash through stdin so there is no
+    # on-disk script file an unprivileged user could pre-create or swap
+    # under root (SEC-02). It only copies from the root-owned staging dir.
+    _UPDATE_HANDOFF_SCRIPT = """#!/bin/bash
+sleep 1
+ok=1
+for f in plugin.json package.json main.py decky.pyi; do
+    cp "$WIFIOPT_SRC/$f" "$WIFIOPT_PLUGIN_DIR/" || ok=0
+done
+mkdir -p "$WIFIOPT_PLUGIN_DIR/dist" "$WIFIOPT_PLUGIN_DIR/defaults" "$WIFIOPT_PLUGIN_DIR/py_modules"
+cp "$WIFIOPT_SRC/dist/index.js" "$WIFIOPT_PLUGIN_DIR/dist/" || ok=0
+cp "$WIFIOPT_SRC/dist/index.js.map" "$WIFIOPT_PLUGIN_DIR/dist/" 2>/dev/null || true
+cp "$WIFIOPT_SRC/defaults/dispatcher.sh.tmpl" "$WIFIOPT_PLUGIN_DIR/defaults/" || ok=0
+if [ "$ok" = "1" ]; then
+    logger -t wifi-optimizer "Updated to $WIFIOPT_LABEL, restarting plugin_loader"
+else
+    logger -t wifi-optimizer "Update to $WIFIOPT_LABEL failed while copying files"
+fi
+rm -rf "$WIFIOPT_STAGE"
+systemctl restart plugin_loader 2>/dev/null || true
+"""
+
     async def apply_update(self) -> dict:
-        """Download and install update from the selected channel, then restart Decky."""
+        """Download, verify, and install an update from the selected channel,
+        then restart Decky. Stable installs the CI-built release zip and
+        checks it against the release's SHA256SUMS; beta installs the branch
+        tarball (no release artifact exists to verify against)."""
         try:
             if not self.UPDATE_REPO:
                 return {"success": False, "message": "Updates disabled in this fork."}
-            info = await self.check_for_update()
-            if not info.get("update_available"):
-                return {"success": False, "message": "No update available."}
-
-            channel = info.get("channel", "stable")
-            latest = info["latest_version"]
-            plugin_dir = decky.DECKY_PLUGIN_DIR
-            repo_name = self.UPDATE_REPO.split("/")[1]
-
-            if channel == "beta":
-                download_url = f"https://github.com/{self.UPDATE_REPO}/archive/refs/heads/beta.tar.gz"
-                src_dir = f"{repo_name}-beta"
-                label = f"beta v{latest}"
-            else:
-                tag = f"v{latest}"
-                download_url = f"https://github.com/{self.UPDATE_REPO}/archive/refs/tags/{tag}.tar.gz"
-                src_dir = f"{repo_name}-{latest}"
-                label = f"v{latest}"
-
-            script = f"""#!/bin/bash
-sleep 2
-PLUGIN_DIR="{plugin_dir}"
-TMP=$(mktemp -d)
-cleanup() {{ rm -rf "$TMP"; rm -f "$0"; }}
-trap cleanup EXIT
-
-curl -sL "{download_url}" -o "$TMP/update.tar.gz"
-tar xzf "$TMP/update.tar.gz" -C "$TMP"
-SRC="$TMP/{src_dir}"
-
-if [ ! -f "$SRC/plugin.json" ]; then
-    logger -t wifi-optimizer "Update failed: download error"
-    exit 1
-fi
-
-cp "$SRC/plugin.json" "$PLUGIN_DIR/"
-cp "$SRC/package.json" "$PLUGIN_DIR/"
-cp "$SRC/main.py" "$PLUGIN_DIR/"
-cp "$SRC/decky.pyi" "$PLUGIN_DIR/"
-mkdir -p "$PLUGIN_DIR/dist" "$PLUGIN_DIR/defaults"
-cp "$SRC/dist/index.js" "$PLUGIN_DIR/dist/"
-cp "$SRC/dist/index.js.map" "$PLUGIN_DIR/dist/" 2>/dev/null || true
-cp "$SRC/defaults/dispatcher.sh.tmpl" "$PLUGIN_DIR/defaults/"
-
-logger -t wifi-optimizer "Updated to {label}, restarting plugin_loader"
-systemctl restart plugin_loader 2>/dev/null || true
-"""
-            script_path = "/tmp/wifi-optimizer-update.sh"
-            with open(script_path, "w") as f:
-                f.write(script)
-            os.chmod(script_path, 0o700)
-
-            clean_env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
-            subprocess.Popen(
-                ["/bin/bash", script_path],
-                start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=clean_env,
-            )
-
-            decky.logger.info(f"Update to {label} initiated (channel={channel})")
-            return {"success": True, "message": f"Updating to {label}..."}
+            if getattr(self, "_update_in_progress", False):
+                return {"success": False, "message": "An update is already in progress."}
+            self._update_in_progress = True
+            try:
+                return await self._apply_update_inner()
+            finally:
+                self._update_in_progress = False
         except Exception as e:
             decky.logger.error(f"apply_update error: {e}")
             return self._unexpected_response(e)
+
+    async def _apply_update_inner(self) -> dict:
+        info = await self.check_for_update()
+        if not info.get("update_available"):
+            return {"success": False, "message": "No update available."}
+        channel = info.get("channel", "stable")
+        latest = str(info.get("latest_version", ""))
+        if not VERSION_RE.match(latest):
+            return {
+                "success": False,
+                "message": f"Refusing update: unexpected version string {latest!r}",
+            }
+        repo_name = self.UPDATE_REPO.split("/")[1]
+
+        # Root-owned staging with an unpredictable name (mkdtemp = mode
+        # 0700): nothing under it can be pre-created or swapped by an
+        # unprivileged user before the hand-off script copies from it.
+        stage_root = tempfile.mkdtemp(prefix="wifi-optimizer-update-")
+        handed_off = False
+        try:
+            extract_dir = os.path.join(stage_root, "src")
+            if channel == "beta":
+                # Beta has no release artifact to verify against; this path
+                # stays TLS/repo trust only, matching the channel's purpose.
+                url = f"https://github.com/{self.UPDATE_REPO}/archive/refs/heads/beta.tar.gz"
+                tar_path = os.path.join(stage_root, "update.tar.gz")
+                r = await asyncio.to_thread(self._download_file, url, tar_path)
+                if not r["success"]:
+                    return {
+                        "success": False,
+                        "message": "Couldn't download the beta update.",
+                        "detail": r.get("stderr", "")[:200],
+                    }
+                await asyncio.to_thread(_safe_extract_tar, tar_path, extract_dir)
+                src = os.path.join(extract_dir, f"{repo_name}-beta")
+                label = f"beta v{latest}"
+                decky.logger.info(
+                    "apply_update: beta channel has no checksum artifact; TLS/repo trust only"
+                )
+            else:
+                tag = f"v{latest}"
+                zip_name = f"wifi-optimizer-streaming-{latest}.zip"
+                base = f"https://github.com/{self.UPDATE_REPO}/releases/download/{tag}"
+                zip_path = os.path.join(stage_root, zip_name)
+                sums_path = os.path.join(stage_root, "SHA256SUMS")
+                r = await asyncio.to_thread(
+                    self._download_file, f"{base}/{zip_name}", zip_path
+                )
+                if not r["success"]:
+                    return {
+                        "success": False,
+                        "message": f"Couldn't download release asset {zip_name}.",
+                        "detail": r.get("stderr", "")[:200],
+                    }
+                r = await asyncio.to_thread(
+                    self._download_file, f"{base}/SHA256SUMS", sums_path, 15
+                )
+                if not r["success"]:
+                    return {
+                        "success": False,
+                        "message": "Couldn't download SHA256SUMS for verification.",
+                        "detail": r.get("stderr", "")[:200],
+                    }
+                with open(sums_path, "r") as f:
+                    sums_text = f.read()
+                ok, detail = _verify_sha256(sums_text, zip_name, zip_path)
+                if not ok:
+                    decky.logger.error(f"apply_update: checksum verification failed: {detail}")
+                    return {
+                        "success": False,
+                        "message": "Checksum verification failed - update aborted.",
+                        "detail": detail,
+                    }
+                await asyncio.to_thread(_safe_extract_zip, zip_path, extract_dir)
+                src = os.path.join(extract_dir, "WiFi Optimizer Streaming")
+                label = f"v{latest}"
+
+            if not os.path.isfile(os.path.join(src, "plugin.json")):
+                return {
+                    "success": False,
+                    "message": "Update package has an unexpected layout - aborted.",
+                }
+
+            # Detached hand-off: the copy + plugin_loader restart must survive
+            # this process being killed by that restart.
+            env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
+            env.update({
+                "WIFIOPT_SRC": src,
+                "WIFIOPT_PLUGIN_DIR": decky.DECKY_PLUGIN_DIR,
+                "WIFIOPT_STAGE": stage_root,
+                "WIFIOPT_LABEL": label,
+            })
+            proc = subprocess.Popen(
+                ["/bin/bash", "-s"],
+                stdin=subprocess.PIPE,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            proc.stdin.write(self._UPDATE_HANDOFF_SCRIPT.encode())
+            proc.stdin.close()
+            handed_off = True
+
+            verified = "yes" if channel != "beta" else "no (beta)"
+            decky.logger.info(
+                f"Update to {label} initiated (channel={channel}, checksum verified={verified})"
+            )
+            return {"success": True, "message": f"Updating to {label}..."}
+        finally:
+            if not handed_off:
+                shutil.rmtree(stage_root, ignore_errors=True)
 
     # ---- WiFi backend switch (iwd / wpa_supplicant) ----
 
