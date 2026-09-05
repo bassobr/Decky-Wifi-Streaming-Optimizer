@@ -101,15 +101,38 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Checkout provides minisign.pub and the signing/verify code; artifacts
+      # are downloaded next to it.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@v4
         with:
           name: plugin-zip
+
+      # SEC-03 (Variant A): sign SHA256SUMS with the release key held as a
+      # repo secret, then verify the fresh signature against the committed
+      # public key. The verify step makes a seed/pubkey mismatch (e.g. a
+      # rotated secret without a pubkey update) fail the release instead of
+      # shipping a signature no client would ever accept. The updater pins
+      # minisign.pub and refuses unsigned stable releases.
+      - name: Sign SHA256SUMS
+        env:
+          MINISIGN_SEED: ${{ secrets.MINISIGN_SEED }}
+        run: |
+          PYTHONPATH=py_modules python3 -m wifioptimizer.minisign \
+            sign SHA256SUMS minisign.pub \
+            --trusted-comment "wifi-optimizer-streaming ${GITHUB_REF_NAME}"
+          PYTHONPATH=py_modules python3 -m wifioptimizer.minisign \
+            verify SHA256SUMS SHA256SUMS.minisig minisign.pub
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" wifi-optimizer-streaming-*.zip SHA256SUMS \
+          gh release create "${GITHUB_REF_NAME}" \
+            wifi-optimizer-streaming-*.zip SHA256SUMS SHA256SUMS.minisig \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes

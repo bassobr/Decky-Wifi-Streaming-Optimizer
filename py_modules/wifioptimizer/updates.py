@@ -16,8 +16,9 @@ import tempfile
 
 from . import settings as settings_store
 from .archives import safe_extract_tar, safe_extract_zip, verify_sha256
-from .constants import VERSION_RE
+from .constants import MINISIGN_PUBKEY, VERSION_RE
 from .deckyshim import decky
+from .minisign import verify_file as minisign_verify_file
 
 
 class UpdatesMixin:
@@ -257,6 +258,37 @@ systemctl restart plugin_loader 2>/dev/null || true
                         "message": "Couldn't download SHA256SUMS for verification.",
                         "detail": r.get("stderr", "")[:200],
                     }
+
+                # Signature first (SEC-03, Variant A): SHA256SUMS itself must
+                # carry a valid minisign signature from the pinned release key
+                # before its hashes are trusted. Zip and sums come from the
+                # same GitHub release, so without this an attacker who can
+                # swap release assets could swap both consistently.
+                sig_path = sums_path + ".minisig"
+                r = await asyncio.to_thread(
+                    self._download_file, f"{base}/SHA256SUMS.minisig", sig_path, 15
+                )
+                if not r["success"]:
+                    return {
+                        "success": False,
+                        "message": "This release is not signed (SHA256SUMS.minisig missing) - update aborted.",
+                        "detail": r.get("stderr", "")[:200],
+                    }
+                with open(sig_path, "r") as f:
+                    sig_text = f.read()
+                ok, detail = await asyncio.to_thread(
+                    minisign_verify_file, sums_path, sig_text, MINISIGN_PUBKEY
+                )
+                if not ok:
+                    decky.logger.error(
+                        f"apply_update: release signature verification failed: {detail}"
+                    )
+                    return {
+                        "success": False,
+                        "message": "Release signature verification failed - update aborted.",
+                        "detail": detail,
+                    }
+
                 with open(sums_path, "r") as f:
                     sums_text = f.read()
                 ok, detail = verify_sha256(sums_text, zip_name, zip_path)
@@ -298,9 +330,9 @@ systemctl restart plugin_loader 2>/dev/null || true
             proc.stdin.close()
             handed_off = True
 
-            verified = "yes" if channel != "beta" else "no (beta)"
+            verified = "signature+checksum" if channel != "beta" else "none (beta)"
             decky.logger.info(
-                f"Update to {label} initiated (channel={channel}, checksum verified={verified})"
+                f"Update to {label} initiated (channel={channel}, verified={verified})"
             )
             return {"success": True, "message": f"Updating to {label}..."}
         finally:

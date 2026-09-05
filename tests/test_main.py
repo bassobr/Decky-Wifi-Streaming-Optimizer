@@ -19,8 +19,9 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, "py_modules"))
 
 import main  # noqa: E402
-from wifioptimizer import archives, constants, parsing  # noqa: E402
+from wifioptimizer import archives, constants, ed25519, parsing  # noqa: E402
 from wifioptimizer import backend_switch as backend_switch_mod  # noqa: E402
+from wifioptimizer import minisign as minisign_mod  # noqa: E402
 from wifioptimizer import settings as settings_store  # noqa: E402
 from wifioptimizer.deckyshim import decky  # noqa: E402
 
@@ -387,6 +388,134 @@ def test_reset_settings_does_not_share_defaults(settings_env, plugin, monkeypatc
     # FUNC-09: reset must not hand out the module-level defaults dict
     assert fresh["streaming_apps"] is not constants.DEFAULT_SETTINGS["streaming_apps"]
     assert fresh is not constants.DEFAULT_SETTINGS
+
+
+# ---- release signing (ed25519 + minisign) ----
+
+# Official RFC 8032 section 7.1 test vectors pin the vendored ed25519
+# implementation to the standard.
+RFC8032_VECTORS = [
+    ("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+     "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+     "",
+     "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+    ("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+     "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+     "72",
+     "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+    ("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+     "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+     "af82",
+     "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"),
+]
+
+
+@pytest.mark.parametrize("seed,pub,msg,sig", RFC8032_VECTORS)
+def test_ed25519_rfc8032_vectors(seed, pub, msg, sig):
+    seed, pub, msg, sig = (bytes.fromhex(seed), bytes.fromhex(pub),
+                           bytes.fromhex(msg), bytes.fromhex(sig))
+    assert ed25519.secret_to_public(seed) == pub
+    assert ed25519.sign(seed, msg) == sig
+    assert ed25519.verify(pub, msg, sig)
+    assert not ed25519.verify(pub, msg + b"x", sig)
+    assert not ed25519.verify(pub, msg, sig[:-1] + bytes([sig[-1] ^ 1]))
+
+
+TEST_SEED = bytes(range(32))
+TEST_KEY_ID = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+
+
+def _test_keypair_texts():
+    pub = ed25519.secret_to_public(TEST_SEED)
+    return minisign_mod.make_public_key_text(TEST_KEY_ID, pub)
+
+
+def test_minisign_sign_verify_roundtrip(tmp_path):
+    pubkey_text = _test_keypair_texts()
+    f = tmp_path / "SHA256SUMS"
+    f.write_text("abc123  wifi-optimizer-streaming-9.9.9.zip\n")
+    sig_text = minisign_mod.sign_file(str(f), TEST_SEED, TEST_KEY_ID, "release v9.9.9")
+    ok, detail = minisign_mod.verify_file(str(f), sig_text, pubkey_text)
+    assert ok, detail
+
+    # tampering with the signed file must fail
+    f.write_text("evil hash  wifi-optimizer-streaming-9.9.9.zip\n")
+    ok, detail = minisign_mod.verify_file(str(f), sig_text, pubkey_text)
+    assert not ok and "invalid signature" in detail
+
+
+def test_minisign_rejects_tampered_trusted_comment(tmp_path):
+    pubkey_text = _test_keypair_texts()
+    f = tmp_path / "file"
+    f.write_text("payload")
+    sig_text = minisign_mod.sign_file(str(f), TEST_SEED, TEST_KEY_ID, "v1")
+    tampered = sig_text.replace("trusted comment: v1", "trusted comment: v2")
+    ok, detail = minisign_mod.verify_file(str(f), tampered, pubkey_text)
+    assert not ok and "trusted-comment" in detail
+
+
+def test_minisign_rejects_wrong_key_id(tmp_path):
+    f = tmp_path / "file"
+    f.write_text("payload")
+    sig_text = minisign_mod.sign_file(str(f), TEST_SEED, TEST_KEY_ID, "v1")
+    other_pub = minisign_mod.make_public_key_text(b"\xff" * 8, ed25519.secret_to_public(TEST_SEED))
+    ok, detail = minisign_mod.verify_file(str(f), sig_text, other_pub)
+    assert not ok and "key ID mismatch" in detail
+
+
+def test_minisign_legacy_raw_mode(tmp_path):
+    # "Ed" signatures (over raw content instead of the BLAKE2b prehash) must
+    # verify too, for compatibility with legacy minisign output.
+    import base64
+    f = tmp_path / "file"
+    f.write_bytes(b"raw content")
+    sig = ed25519.sign(TEST_SEED, b"raw content")
+    gsig = ed25519.sign(TEST_SEED, sig + b"tc")
+    sig_text = (
+        "untrusted comment: legacy\n"
+        + base64.standard_b64encode(b"Ed" + TEST_KEY_ID + sig).decode() + "\n"
+        + "trusted comment: tc\n"
+        + base64.standard_b64encode(gsig).decode() + "\n"
+    )
+    ok, detail = minisign_mod.verify_file(str(f), sig_text, _test_keypair_texts())
+    assert ok, detail
+
+
+def test_embedded_pubkey_matches_repo_file():
+    with open(os.path.join(_ROOT, "minisign.pub")) as f:
+        assert constants.MINISIGN_PUBKEY == f.read()
+    # and it parses as a valid key
+    key_id, pub = minisign_mod.parse_public_key(constants.MINISIGN_PUBKEY)
+    assert len(key_id) == 8 and len(pub) == 32
+
+
+def test_minisign_cli_refuses_mismatched_seed(tmp_path, monkeypatch):
+    import base64
+    f = tmp_path / "file"
+    f.write_text("payload")
+    pubkey_path = tmp_path / "key.pub"
+    pubkey_path.write_text(_test_keypair_texts())
+    wrong_seed = bytes(range(1, 33))
+    monkeypatch.setenv(minisign_mod.SEED_ENV, base64.standard_b64encode(wrong_seed).decode())
+    rc = minisign_mod.main(["sign", str(f), str(pubkey_path)])
+    assert rc == 1
+    assert not (tmp_path / "file.minisig").exists()
+
+
+def test_minisign_cli_sign_and_verify(tmp_path, monkeypatch):
+    import base64
+    f = tmp_path / "SHA256SUMS"
+    f.write_text("hash  file.zip\n")
+    pubkey_path = tmp_path / "key.pub"
+    pubkey_path.write_text(_test_keypair_texts())
+    monkeypatch.setenv(minisign_mod.SEED_ENV, base64.standard_b64encode(TEST_SEED).decode())
+    assert minisign_mod.main(
+        ["sign", str(f), str(pubkey_path), "--trusted-comment", "wifi-optimizer v9"]
+    ) == 0
+    assert minisign_mod.main(
+        ["verify", str(f), str(f) + ".minisig", str(pubkey_path)]
+    ) == 0
+    assert "wifi-optimizer v9" in (tmp_path / "SHA256SUMS.minisig").read_text()
 
 
 # ---- backend switch frame ----
