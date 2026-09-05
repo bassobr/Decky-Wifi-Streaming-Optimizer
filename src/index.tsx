@@ -13,6 +13,8 @@ import {
   ButtonItem,
   DropdownItem,
   TextField,
+  ConfirmModal,
+  showModal,
   staticClasses,
 } from "@decky/ui";
 import { definePlugin } from "@decky/api";
@@ -90,7 +92,7 @@ class ErrorBoundary extends Component<
         <Banner variant="error">
           WiFi Optimizer hit an unexpected error. Close and reopen the panel to
           recover. If it keeps happening, please report at
-          github.com/ArcadaLabs-Jason/WifiOptimizer.
+          github.com/bassobr/Decky-Wifi-Streaming-Optimizer.
         </Banner>
       );
     }
@@ -133,6 +135,9 @@ function Content() {
   const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevConnectedRef = useRef<boolean | null>(null);
   const lastUpdateCheckAtRef = useRef<number>(0);
+  // True while the user is typing custom DNS servers; the 3s status poll
+  // must not overwrite their in-progress input with the saved value.
+  const dnsEditingRef = useRef(false);
 
   const setBusy = useCallback((val: boolean) => {
     busyRef.current = val;
@@ -160,7 +165,10 @@ function Content() {
       const s = await backend.getStatus();
       setStatus(s);
       if (s.settings) {
-        if (s.settings.dns_provider === "custom") {
+        // Sync the DNS field from saved settings, but never while the user
+        // is typing - typing on the on-screen keyboard easily takes longer
+        // than one poll interval and the input would be clobbered mid-edit.
+        if (s.settings.dns_provider === "custom" && !dnsEditingRef.current) {
           setCustomDnsInput(s.settings.dns_servers || "");
         }
       }
@@ -285,12 +293,13 @@ function Content() {
     const id = setTimeout(() => {
       console.error("WiFi Optimizer: update didn't complete within 60s");
       setUpdating(false);
+      setBusy(false);
       setUpdateError(
         "Update didn't complete. Try again, or reinstall manually from Konsole."
       );
     }, UPDATE_TIMEOUT_MS);
     return () => clearTimeout(id);
-  }, [updating]);
+  }, [updating, setBusy]);
 
   // Periodic update re-check - QAM often caches the panel across close/reopen,
   // so the mount-effect check doesn't re-fire. This heartbeat catches new
@@ -397,6 +406,11 @@ function Content() {
   const handleForceReapply = () =>
     handleToggle("reapply", () => backend.reapplyAll());
 
+  // Drift banner "Fix now": reapply everything that's enabled. Unlike
+  // Optimize Safe this also covers band/IPv6/DNS drift - get_status only
+  // reports drift and never mutates system state itself.
+  const handleFixDrift = handleForceReapply;
+
   const handleStreamingMode = (val: boolean) =>
     handleToggle("streaming_mode", () => backend.setStreamingMode(val));
 
@@ -419,6 +433,26 @@ function Content() {
       await refreshStatus(true);
       setBusy(false);
     }
+  };
+
+  // One stray tap on a gamepad-focused button must not wipe all settings -
+  // ask first. The actual reset only runs from the modal's OK.
+  const confirmResetSettings = () => {
+    if (busyRef.current) return;
+    showModal(
+      <ConfirmModal
+        strTitle="Reset Settings"
+        strDescription={
+          "Reverts the runtime optimizations and deletes the plugin's settings. " +
+          "Per-network changes (BSSID lock, band, DNS, IPv6) stay on saved " +
+          "networks until you forget and rejoin them."
+        }
+        strOKButtonText="Reset"
+        onOK={() => {
+          void handleResetSettings();
+        }}
+      />
+    );
   };
 
   const handleBackendToggle = async (on: boolean) => {
@@ -471,10 +505,22 @@ function Content() {
   // section. Share the updating/updateError state so either surface can
   // initiate a check or apply an update.
   const handleApplyUpdate = async () => {
+    // Same re-entrancy guard as every other handler: a double-tap before the
+    // re-render must not spawn two concurrent update scripts.
+    if (busyRef.current) return;
+    setBusy(true);
     setUpdateError(null);
     setUpdating(true);
     try {
-      await backend.applyUpdate();
+      const res = await backend.applyUpdate();
+      if (res && res.success === false) {
+        // Update refused (no release asset, checksum mismatch, ...) - the
+        // plugin is NOT restarting, so unlock the UI and show why.
+        setUpdating(false);
+        setBusy(false);
+        setUpdateError(res.message ?? "Update failed to start.");
+      }
+      // On success plugin_loader restarts us; the UI stays locked until then.
     } catch {
       // plugin_loader restart killed the connection; expected
     }
@@ -582,7 +628,7 @@ function Content() {
           {driftCount} setting{driftCount > 1 ? "s" : ""} drifted after wake.{" "}
           <span
             style={{ textDecoration: "underline", cursor: "pointer" }}
-            onClick={handleOptimize}
+            onClick={handleFixDrift}
           >
             Fix now
           </span>
@@ -744,7 +790,7 @@ function Content() {
           label="Custom DNS"
           subtitle="Override DNS servers for this network"
           explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network."
-          {...getBadge(undefined, status, errors.dns ?? null)}
+          {...getBadge("dns", status, errors.dns ?? null)}
           checked={s?.dns_enabled ?? false}
           disabled={isBusy || (!connected && !s?.dns_enabled)}
           error={errors.dns}
@@ -774,10 +820,12 @@ function Content() {
                   <TextField
                     label="DNS servers (space-separated)"
                     value={customDnsInput}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                      setCustomDnsInput(e.target.value)
-                    }
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                      dnsEditingRef.current = true;
+                      setCustomDnsInput(e.target.value);
+                    }}
                     onBlur={() => {
+                      dnsEditingRef.current = false;
                       if (customDnsInput) {
                         handleToggle("dns", () =>
                           backend.setDns(true, "custom", customDnsInput)
@@ -847,7 +895,7 @@ function Content() {
         connected={connected}
         isBusy={isBusy}
         onForceReapply={handleForceReapply}
-        onReset={handleResetSettings}
+        onReset={confirmResetSettings}
       />
 
       <UpdatesSection
@@ -905,8 +953,8 @@ export default definePlugin(() => {
   }
 
   return {
-    name: "WiFi Optimizer",
-    titleView: <div className={staticClasses.Title}>WiFi Optimizer</div>,
+    name: "WiFi Optimizer Streaming",
+    titleView: <div className={staticClasses.Title}>WiFi Optimizer Streaming</div>,
     content: (
       <ErrorBoundary>
         <Content />
