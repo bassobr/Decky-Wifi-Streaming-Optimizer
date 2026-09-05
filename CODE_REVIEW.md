@@ -11,7 +11,7 @@
 >
 > **Teilweise behoben (Rest bewusst offen):**
 > - **SEC-03:** Installer und Stable-Updater installieren jetzt den CI-gebauten Release-Zip und prüfen ihn gegen die im Release veröffentlichte `SHA256SUMS` (schützt Transport-Integrität und Artefakt-Konsistenz). Der Beta-Kanal bleibt Branch-Tarball ohne Prüfsumme (kein Release-Artefakt vorhanden). Kryptografische **Signaturen** (z. B. minisign/Sigstore mit im Plugin eingebettetem Public Key) bleiben offen — sie erfordern Schlüsselverwaltung durch den Maintainer.
-> - **MAINT-02:** Risikoarme Teile umgesetzt (Parser als reine, getestete Helfer extrahiert; nmcli-Abfragen gebatcht 12→9 Subprozesse/Tick; `_revert_runtime_state`/`_remove_plugin_files` dedupliziert). Die Modularisierung nach `py_modules/` und die Zusammenführung der beiden Backend-Switch-Worker bleiben offen — als größeres Refactoring erst mit der jetzt vorhandenen Testbasis sinnvoll.
+> - **MAINT-02:** Weitgehend umgesetzt. Zunächst die risikoarmen Teile (Parser als reine, getestete Helfer; nmcli-Abfragen gebatcht 12→9 Subprozesse/Tick; `_revert_runtime_state`/`_remove_plugin_files` dedupliziert); anschließend die **Modularisierung nach `py_modules/wifioptimizer`** (14 Domänen-Module, `main.py` von ~3050 auf ~300 Zeilen reduziert, nur noch Plugin-Komposition + Lifecycle). Alle Auslieferungswege (Release-Zip, install.sh, Update-Handoff) kopieren das Paket mit; ein Selbstheilungs-Shim in `main.py` stellt das Paket aus dem verifizierten Release-Zip wieder her, falls ein Alt-Updater (≤ 0.13.0) es beim Update nicht mitkopiert hat. Verbleibend (optional): Zusammenführung der beiden strukturell ähnlichen Backend-Switch-Worker.
 
 ---
 

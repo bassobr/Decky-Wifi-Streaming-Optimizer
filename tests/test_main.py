@@ -1,7 +1,7 @@
 """Backend unit tests. Run with `python3 -m pytest tests/ -q` from the repo
-root. main.py falls back to a decky stub when the real module is absent, so
-these tests run on any machine; everything that would touch the system goes
-through monkeypatched _run_cmd/_get_wifi_interface."""
+root. The wifioptimizer package falls back to a decky stub when the real
+module is absent, so these tests run on any machine; everything that would
+touch the system goes through monkeypatched _run_cmd/_get_wifi_interface."""
 
 import asyncio
 import io
@@ -14,8 +14,14 @@ import zipfile
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, "py_modules"))
+
 import main  # noqa: E402
+from wifioptimizer import archives, constants, parsing  # noqa: E402
+from wifioptimizer import settings as settings_store  # noqa: E402
+from wifioptimizer.deckyshim import decky  # noqa: E402
 
 
 OK_RESULT = {"success": True, "stdout": "", "stderr": "", "returncode": 0}
@@ -25,12 +31,12 @@ OK_RESULT = {"success": True, "stdout": "", "stderr": "", "returncode": 0}
 def settings_env(tmp_path, monkeypatch):
     """Redirect SETTINGS_FILE into a temp dir and reset the cache."""
     settings_file = tmp_path / "settings.json"
-    monkeypatch.setattr(main, "SETTINGS_FILE", str(settings_file))
-    main._settings_cache["stat"] = None
-    main._settings_cache["data"] = None
+    monkeypatch.setattr(settings_store, "SETTINGS_FILE", str(settings_file))
+    settings_store._settings_cache["stat"] = None
+    settings_store._settings_cache["data"] = None
     yield settings_file
-    main._settings_cache["stat"] = None
-    main._settings_cache["data"] = None
+    settings_store._settings_cache["stat"] = None
+    settings_store._settings_cache["data"] = None
 
 
 @pytest.fixture
@@ -41,10 +47,10 @@ def plugin():
 # ---- settings load/save ----
 
 def test_load_settings_missing_returns_defaults(settings_env):
-    settings = main._load_settings()
-    assert settings == main.DEFAULT_SETTINGS
-    assert settings is not main.DEFAULT_SETTINGS
-    assert settings["streaming_apps"] is not main.DEFAULT_SETTINGS["streaming_apps"]
+    settings = settings_store.load_settings()
+    assert settings == constants.DEFAULT_SETTINGS
+    assert settings is not constants.DEFAULT_SETTINGS
+    assert settings["streaming_apps"] is not constants.DEFAULT_SETTINGS["streaming_apps"]
 
 
 def test_load_settings_merges_defaults_and_strips_stale(settings_env):
@@ -53,7 +59,7 @@ def test_load_settings_merges_defaults_and_strips_stale(settings_env):
         "stale_key_from_old_version": 1,
         "streaming_apps": {"moonlight": False, "removed_app": True},
     }))
-    settings = main._load_settings()
+    settings = settings_store.load_settings()
     assert settings["power_save_disabled"] is False
     assert "stale_key_from_old_version" not in settings
     # per-app merge: user choice kept, new presets default to enabled
@@ -67,8 +73,8 @@ def test_load_settings_merges_defaults_and_strips_stale(settings_env):
 @pytest.mark.parametrize("content", ["{not json", json.dumps([1, 2, 3])])
 def test_load_settings_corrupt_backs_up_file(settings_env, content):
     settings_env.write_text(content)
-    settings = main._load_settings()
-    assert settings == main.DEFAULT_SETTINGS
+    settings = settings_store.load_settings()
+    assert settings == constants.DEFAULT_SETTINGS
     assert not settings_env.exists()
     corrupt = settings_env.parent / "settings.json.corrupt"
     assert corrupt.exists()
@@ -76,11 +82,11 @@ def test_load_settings_corrupt_backs_up_file(settings_env, content):
 
 
 def test_save_and_reload_roundtrip(settings_env):
-    settings = main._load_settings()
+    settings = settings_store.load_settings()
     settings["dns_enabled"] = True
     settings["dns_servers"] = "9.9.9.9"
-    main._save_settings(settings)
-    reloaded = main._load_settings()
+    settings_store.save_settings(settings)
+    reloaded = settings_store.load_settings()
     assert reloaded["dns_enabled"] is True
     assert reloaded["dns_servers"] == "9.9.9.9"
 
@@ -91,7 +97,7 @@ def test_save_settings_ignores_planted_tmp_symlink(settings_env, tmp_path):
     target = tmp_path / "victim.txt"
     target.write_text("precious")
     os.symlink(target, settings_env.parent / "settings.json.tmp")
-    main._save_settings(dict(main.DEFAULT_SETTINGS))
+    settings_store.save_settings(dict(constants.DEFAULT_SETTINGS))
     assert target.read_text() == "precious"
     assert json.loads(settings_env.read_text())["driver"] == "unknown"
 
@@ -101,7 +107,7 @@ def test_save_settings_replaces_symlinked_settings_file(settings_env, tmp_path):
     target = tmp_path / "victim2.txt"
     target.write_text("precious")
     os.symlink(target, settings_env)
-    main._save_settings(dict(main.DEFAULT_SETTINGS))
+    settings_store.save_settings(dict(constants.DEFAULT_SETTINGS))
     assert target.read_text() == "precious"
     assert not settings_env.is_symlink()
 
@@ -112,17 +118,17 @@ def test_save_settings_refuses_symlinked_settings_dir(tmp_path, monkeypatch):
     real_dir.mkdir()
     link_dir = tmp_path / "linked"
     os.symlink(real_dir, link_dir)
-    monkeypatch.setattr(main, "SETTINGS_FILE", str(link_dir / "settings.json"))
-    main._settings_cache["stat"] = None
-    main._settings_cache["data"] = None
+    monkeypatch.setattr(settings_store, "SETTINGS_FILE", str(link_dir / "settings.json"))
+    settings_store._settings_cache["stat"] = None
+    settings_store._settings_cache["data"] = None
     with pytest.raises(OSError):
-        main._save_settings(dict(main.DEFAULT_SETTINGS))
+        settings_store.save_settings(dict(constants.DEFAULT_SETTINGS))
 
 
-def test_update_settings_fields_is_isolated(settings_env, plugin):
-    main._save_settings(dict(main.DEFAULT_SETTINGS))
-    plugin._update_settings_fields(last_connection_uuid="abc", priority_set=True)
-    settings = main._load_settings()
+def test_update_settings_fields_is_isolated(settings_env):
+    settings_store.save_settings(dict(constants.DEFAULT_SETTINGS))
+    settings_store.update_settings_fields(last_connection_uuid="abc", priority_set=True)
+    settings = settings_store.load_settings()
     assert settings["last_connection_uuid"] == "abc"
     assert settings["priority_set"] is True
     assert settings["power_save_disabled"] is True  # untouched
@@ -146,7 +152,7 @@ def test_build_patterns_presets_and_custom():
         "streaming_apps": {"moonlight": True, "chiaki": False},
         "streaming_custom_patterns": "MyApp, xx yzapp",
     }
-    patterns = main._build_patterns(settings)
+    patterns = parsing.build_patterns(settings)
     flat = [p for p, _ in patterns]
     assert "moonlight" in flat
     assert "chiaki" not in flat  # disabled preset
@@ -160,13 +166,13 @@ def test_set_streaming_custom_patterns_rejects_short(settings_env, plugin):
     assert result["success"] is False
     assert "ab" in result["message"]
     # nothing persisted
-    assert main._load_settings()["streaming_custom_patterns"] == ""
+    assert settings_store.load_settings()["streaming_custom_patterns"] == ""
 
 
 def test_set_streaming_custom_patterns_accepts_valid(settings_env, plugin):
     result = asyncio.run(plugin.set_streaming_custom_patterns("  vortex, gamehub  "))
     assert result["success"] is True
-    assert main._load_settings()["streaming_custom_patterns"] == "vortex, gamehub"
+    assert settings_store.load_settings()["streaming_custom_patterns"] == "vortex, gamehub"
 
 
 # ---- update check / verification ----
@@ -188,7 +194,7 @@ def _fake_github(monkeypatch, plugin, payload: dict):
     ],
 )
 def test_check_for_update_stable(settings_env, plugin, monkeypatch, current, tag, expected):
-    monkeypatch.setattr(main.decky, "DECKY_PLUGIN_VERSION", current)
+    monkeypatch.setattr(decky, "DECKY_PLUGIN_VERSION", current)
     _fake_github(monkeypatch, plugin, {"tag_name": tag})
     result = asyncio.run(plugin.check_for_update())
     assert result["success"] is True
@@ -196,10 +202,10 @@ def test_check_for_update_stable(settings_env, plugin, monkeypatch, current, tag
 
 
 def test_check_for_update_beta_differs(settings_env, plugin, monkeypatch):
-    settings = main._load_settings()
+    settings = settings_store.load_settings()
     settings["update_channel"] = "beta"
-    main._save_settings(settings)
-    monkeypatch.setattr(main.decky, "DECKY_PLUGIN_VERSION", "0.12.2")
+    settings_store.save_settings(settings)
+    monkeypatch.setattr(decky, "DECKY_PLUGIN_VERSION", "0.12.2")
     _fake_github(monkeypatch, plugin, {"version": "0.12.3-beta"})
     result = asyncio.run(plugin.check_for_update())
     assert result["update_available"] is True
@@ -215,18 +221,24 @@ def test_apply_update_rejects_bad_version(settings_env, plugin, monkeypatch):
     assert "version string" in result["message"]
 
 
+def test_update_handoff_script_copies_py_modules(plugin):
+    # The modularized backend must survive updates: the hand-off script has
+    # to copy py_modules/ content, not just the historic fixed file list.
+    assert 'cp -r "$WIFIOPT_SRC/py_modules/."' in plugin._UPDATE_HANDOFF_SCRIPT
+
+
 def test_verify_sha256(tmp_path):
     f = tmp_path / "a.zip"
     f.write_bytes(b"hello world")
     import hashlib
     digest = hashlib.sha256(b"hello world").hexdigest()
-    ok, _ = main._verify_sha256(f"{digest}  a.zip\n", "a.zip", str(f))
+    ok, _ = archives.verify_sha256(f"{digest}  a.zip\n", "a.zip", str(f))
     assert ok
-    ok, _ = main._verify_sha256(f"{digest} *a.zip\n", "a.zip", str(f))  # binary marker
+    ok, _ = archives.verify_sha256(f"{digest} *a.zip\n", "a.zip", str(f))  # binary marker
     assert ok
-    ok, detail = main._verify_sha256(f"{'0' * 64}  a.zip\n", "a.zip", str(f))
+    ok, detail = archives.verify_sha256(f"{'0' * 64}  a.zip\n", "a.zip", str(f))
     assert not ok and "mismatch" in detail
-    ok, detail = main._verify_sha256(f"{digest}  other.zip\n", "a.zip", str(f))
+    ok, detail = archives.verify_sha256(f"{digest}  other.zip\n", "a.zip", str(f))
     assert not ok and "no entry" in detail
 
 
@@ -235,12 +247,12 @@ def test_safe_extract_zip_rejects_traversal(tmp_path):
     with zipfile.ZipFile(evil, "w") as z:
         z.writestr("../escape.txt", "boom")
     with pytest.raises(ValueError):
-        main._safe_extract_zip(str(evil), str(tmp_path / "out"))
+        archives.safe_extract_zip(str(evil), str(tmp_path / "out"))
 
     good = tmp_path / "good.zip"
     with zipfile.ZipFile(good, "w") as z:
         z.writestr("Plugin/plugin.json", "{}")
-    main._safe_extract_zip(str(good), str(tmp_path / "out2"))
+    archives.safe_extract_zip(str(good), str(tmp_path / "out2"))
     assert (tmp_path / "out2" / "Plugin" / "plugin.json").exists()
 
 
@@ -261,12 +273,12 @@ def test_safe_extract_tar_rejects_traversal(tmp_path):
     evil = tmp_path / "evil.tar.gz"
     _make_tar(evil, "../escape.txt")
     with pytest.raises(Exception):
-        main._safe_extract_tar(str(evil), str(tmp_path / "out"))
+        archives.safe_extract_tar(str(evil), str(tmp_path / "out"))
     assert not (tmp_path / "escape.txt").exists()
 
     good = tmp_path / "good.tar.gz"
     _make_tar(good, "repo-beta/plugin.json")
-    main._safe_extract_tar(str(good), str(tmp_path / "out2"))
+    archives.safe_extract_tar(str(good), str(tmp_path / "out2"))
     assert (tmp_path / "out2" / "repo-beta" / "plugin.json").exists()
 
 
@@ -283,18 +295,18 @@ IW_LINK_OUT = """Connected to aa:bb:cc:dd:ee:ff (on wlan0)
 
 
 def test_parse_iw_link():
-    info = main._parse_iw_link(IW_LINK_OUT)
+    info = parsing.parse_iw_link(IW_LINK_OUT)
     assert info["signal_dbm"] == "-52 dBm"
     assert info["tx_bitrate"].startswith("866.7 MBit/s")
     assert info["frequency"] == "5180"
-    assert main._parse_iw_link("") == {}
+    assert parsing.parse_iw_link("") == {}
 
 
 def test_parse_iw_channel():
     out = "Interface wlan0\n\tchannel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz\n"
-    assert main._parse_iw_channel(out) == "36 (80 MHz)"
-    assert main._parse_iw_channel("channel 6 (2437 MHz)") == "6"
-    assert main._parse_iw_channel("no channel here") is None
+    assert parsing.parse_iw_channel(out) == "36 (80 MHz)"
+    assert parsing.parse_iw_channel("channel 6 (2437 MHz)") == "6"
+    assert parsing.parse_iw_channel("no channel here") is None
 
 
 def test_parse_nmcli_fields():
@@ -306,7 +318,7 @@ def test_parse_nmcli_fields():
         "IP4.DNS[1]:1.1.1.1\n"
         "IP4.DNS[2]:1.0.0.1\n"
     )
-    fields = main._parse_nmcli_fields(out)
+    fields = parsing.parse_nmcli_fields(out)
     assert fields["802-11-wireless.bssid"] == ["AA:BB:CC:DD:EE:FF"]
     assert fields["ipv6.method"] == ["disabled"]
     assert fields["IP4.DNS"] == ["1.1.1.1", "1.0.0.1"]
@@ -314,26 +326,26 @@ def test_parse_nmcli_fields():
 
 
 def test_dns_drifted():
-    assert main._dns_drifted("1.1.1.1 1.0.0.1", ["1.1.1.1", "1.0.0.1"]) is False
-    assert main._dns_drifted("1.1.1.1 1.0.0.1", ["192.168.1.1"]) is True
-    assert main._dns_drifted("", ["192.168.1.1"]) is False
-    assert main._dns_drifted("1.1.1.1", []) is True
+    assert parsing.dns_drifted("1.1.1.1 1.0.0.1", ["1.1.1.1", "1.0.0.1"]) is False
+    assert parsing.dns_drifted("1.1.1.1 1.0.0.1", ["192.168.1.1"]) is True
+    assert parsing.dns_drifted("", ["192.168.1.1"]) is False
+    assert parsing.dns_drifted("1.1.1.1", []) is True
 
 
 # ---- snapshot / restore ----
 
 def test_txq_off_value(plugin):
-    assert plugin._txq_off_value({"txqueuelen_snapshot": ""}) == main.TXQ_DEFAULT
+    assert plugin._txq_off_value({"txqueuelen_snapshot": ""}) == constants.TXQ_DEFAULT
     assert plugin._txq_off_value({"txqueuelen_snapshot": "1500"}) == "1500"
     # our own tuned values never count as "prior state"
-    assert plugin._txq_off_value({"txqueuelen_snapshot": main.TXQ_TUNED}) == main.TXQ_DEFAULT
-    assert plugin._txq_off_value({"txqueuelen_snapshot": main.TXQ_CAKE}) == main.TXQ_DEFAULT
+    assert plugin._txq_off_value({"txqueuelen_snapshot": constants.TXQ_TUNED}) == constants.TXQ_DEFAULT
+    assert plugin._txq_off_value({"txqueuelen_snapshot": constants.TXQ_CAKE}) == constants.TXQ_DEFAULT
 
 
 def test_buffer_tuning_restore_prefers_snapshot(settings_env, plugin, monkeypatch):
-    settings = main._load_settings()
+    settings = settings_store.load_settings()
     settings["sysctl_snapshot"] = {"net.core.rmem_max": "425984"}
-    main._save_settings(settings)
+    settings_store.save_settings(settings)
 
     recorded = []
 
@@ -350,13 +362,13 @@ def test_buffer_tuning_restore_prefers_snapshot(settings_env, plugin, monkeypatc
     assert "net.core.rmem_max=425984" in sysctl_writes  # snapshot wins
     assert "net.core.wmem_max=212992" in sysctl_writes  # fallback to default
     # snapshot cleared after restore
-    assert main._load_settings()["sysctl_snapshot"] == {}
+    assert settings_store.load_settings()["sysctl_snapshot"] == {}
 
 
-def test_merge_snapshot_keeps_first_capture(settings_env, plugin):
-    plugin._merge_snapshot("pcie_snapshot", {"/sys/x": "1"})
-    plugin._merge_snapshot("pcie_snapshot", {"/sys/x": "0", "/sys/y": "auto"})
-    snap = main._load_settings()["pcie_snapshot"]
+def test_merge_snapshot_keeps_first_capture(settings_env):
+    settings_store.merge_snapshot("pcie_snapshot", {"/sys/x": "1"})
+    settings_store.merge_snapshot("pcie_snapshot", {"/sys/x": "0", "/sys/y": "auto"})
+    snap = settings_store.load_settings()["pcie_snapshot"]
     assert snap == {"/sys/x": "1", "/sys/y": "auto"}
 
 
@@ -364,20 +376,22 @@ def test_reset_settings_does_not_share_defaults(settings_env, plugin, monkeypatc
     monkeypatch.setattr(plugin, "_run_cmd", lambda *a, **k: dict(OK_RESULT))
     monkeypatch.setattr(plugin, "_get_wifi_interface", lambda: None)
     saved = []
-    orig_save = main._save_settings
-    monkeypatch.setattr(main, "_save_settings", lambda d: (saved.append(d), orig_save(d)))
+    orig_save = settings_store.save_settings
+    monkeypatch.setattr(
+        settings_store, "save_settings", lambda d: (saved.append(d), orig_save(d))
+    )
     result = asyncio.run(plugin.reset_settings())
     assert result["success"] is True
     fresh = saved[-1]
     # FUNC-09: reset must not hand out the module-level defaults dict
-    assert fresh["streaming_apps"] is not main.DEFAULT_SETTINGS["streaming_apps"]
-    assert fresh is not main.DEFAULT_SETTINGS
+    assert fresh["streaming_apps"] is not constants.DEFAULT_SETTINGS["streaming_apps"]
+    assert fresh is not constants.DEFAULT_SETTINGS
 
 
 # ---- dispatcher rendering ----
 
 def test_render_dispatcher_script(plugin):
-    template_path = os.path.join(os.path.dirname(__file__), "..", "defaults", "dispatcher.sh.tmpl")
+    template_path = os.path.join(_ROOT, "defaults", "dispatcher.sh.tmpl")
     with open(template_path) as f:
         template = f.read()
     rendered = plugin._render_dispatcher_script(template)
@@ -386,9 +400,9 @@ def test_render_dispatcher_script(plugin):
                         "__TXQ_TUNED__", "__TXQ_CAKE__"):
         assert placeholder not in rendered
     assert "sysctl -w net.core.rmem_max=16777216" in rendered
-    assert " ".join(main.CAKE_QDISC_ARGS) in rendered
+    assert " ".join(constants.CAKE_QDISC_ARGS) in rendered
     assert '"$DRIVER" = "rtw88"' in rendered
-    assert main.ENFORCED_DIR in rendered
+    assert constants.ENFORCED_DIR in rendered
     # an actual eval invocation must never come back (SEC-04); the word may
     # appear in comments explaining exactly that
     for line in rendered.splitlines():
@@ -400,7 +414,7 @@ def test_rendered_dispatcher_passes_bash_syntax_check(plugin, tmp_path):
     bash = shutil_which("bash")
     if not bash:
         pytest.skip("bash not available")
-    template_path = os.path.join(os.path.dirname(__file__), "..", "defaults", "dispatcher.sh.tmpl")
+    template_path = os.path.join(_ROOT, "defaults", "dispatcher.sh.tmpl")
     with open(template_path) as f:
         rendered = plugin._render_dispatcher_script(f.read())
     script = tmp_path / "dispatcher.sh"

@@ -123,7 +123,9 @@ cp "$SRC/decky.pyi" "$PLUGIN_DIR/"
 cp "$SRC/dist/index.js" "$PLUGIN_DIR/dist/"
 cp "$SRC/dist/index.js.map" "$PLUGIN_DIR/dist/" 2>/dev/null || true
 cp "$SRC/defaults/dispatcher.sh.tmpl" "$PLUGIN_DIR/defaults/"
-touch "$PLUGIN_DIR/py_modules/.keep"
+# The backend is modularized under py_modules/wifioptimizer - main.py cannot
+# run without it.
+cp -r "$SRC/py_modules/." "$PLUGIN_DIR/py_modules/"
 
 # Restart Decky
 echo "Restarting Decky Loader..."
