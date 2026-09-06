@@ -1,0 +1,22 @@
+# Keeps the (build-time) npm dependencies and the SHA-pinned GitHub Actions
+# fresh. Security updates open PRs immediately; regular version updates are
+# grouped weekly to limit PR noise for a solo-maintained repo.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
